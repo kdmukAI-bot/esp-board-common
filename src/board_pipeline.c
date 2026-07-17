@@ -58,6 +58,8 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     s_lvgl_display_config.portrait_direct = false;
     s_lvgl_display_config.portrait_x = 0;
     s_lvgl_display_config.portrait_y = 0;
+    /* 3->2 decimated blit is likewise per-session opt-in (480-decode scans). */
+    s_lvgl_display_config.decimate_3to2 = false;
 
     /* Camera pre-rotation into the single PPA SRM pass (crop+scale+rotate).
      * DSI landscape (ST7701): the display flush rotates the whole LVGL canvas

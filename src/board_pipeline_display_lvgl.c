@@ -86,6 +86,14 @@ typedef struct {
     bool    portrait_direct;
     int32_t portrait_x;
     int32_t portrait_y;
+
+    /* 3->2 decimated blit: frame (width x height, e.g. 480²) is downsampled to
+     * out_w x out_h (e.g. 320²) at blit time by dropping every 3rd column/row.
+     * out_w/out_h == width/height when decimation is off, so all panel-space
+     * math below uses out_w/out_h unconditionally. */
+    bool     decimate_3to2;
+    uint32_t out_w;
+    uint32_t out_h;
 } lvgl_display_ctx_t;
 
 /* ── Dummy-draw push: striped DMA blit bypassing LVGL ── */
@@ -112,10 +120,16 @@ static bool push_frame_dummy_draw(lvgl_display_ctx_t *ctx,
         return true;
     }
 
-    /* SPI panels: byte-swap + striped DMA through internal-RAM buffer */
-    const size_t row_bytes = width * 2;
+    /* SPI panels: byte-swap + striped DMA through internal-RAM buffer.
+     * When decimate_3to2 is on, each stripe is gathered from the larger source
+     * frame (drop every 3rd column/row) instead of copied 1:1 — out_w/out_h
+     * are the panel-space blit dimensions either way (== width/height when
+     * decimation is off). */
+    const size_t row_bytes = width * 2;      /* SOURCE frame row pitch */
+    const uint32_t out_w = ctx->out_w;
+    const uint32_t out_h = ctx->out_h;
     const uint8_t *src_fb = rgb565_buf;
-    uint32_t row = 0;
+    uint32_t row = 0;                        /* output-space row cursor */
     uint32_t x = ctx->x_offset;
     bool ok = true;
 
@@ -124,22 +138,40 @@ static bool push_frame_dummy_draw(lvgl_display_ctx_t *ctx,
      * SPI writer. No LVGL port lock is taken — there is nothing to serialize
      * against on the bus. (Legacy dummy-draw with LVGL stopped is also
      * sole-writer.) */
-    while (row < height) {
-        uint32_t block = height - row;
+    while (row < out_h) {
+        uint32_t block = out_h - row;
         if (block > ctx->dma_stripe_lines)
             block = ctx->dma_stripe_lines;
 
-        const uint16_t *src = (const uint16_t *)(src_fb + (size_t)row * row_bytes);
-        copy_swap_u16((uint16_t *)ctx->dma_buf, src, (size_t)width * block);
+        if (!ctx->decimate_3to2) {
+            const uint16_t *src = (const uint16_t *)(src_fb + (size_t)row * row_bytes);
+            copy_swap_u16((uint16_t *)ctx->dma_buf, src, (size_t)out_w * block);
+        } else {
+            /* Decimating gather: output (ox,oy) <- source (ox + ox/2, oy + oy/2)
+             * — i.e. keep source rows/cols 0,1, skip 2, keep 3,4, skip 5, ...
+             * (480*2/3 == 320 exactly). Byte-swap inline, same as copy_swap_u16.
+             * out_w is even (2/3 of a multiple of 3 panel squares in practice),
+             * but handle odd widths anyway. */
+            for (uint32_t r = 0; r < block; r++) {
+                uint32_t oy = row + r;
+                const uint16_t *src = (const uint16_t *)
+                    (src_fb + (size_t)(oy + oy / 2) * row_bytes);
+                uint16_t *dst = (uint16_t *)ctx->dma_buf + (size_t)r * out_w;
+                for (uint32_t ox = 0; ox < out_w; ox++) {
+                    uint16_t p = src[ox + ox / 2];
+                    dst[ox] = (uint16_t)((p >> 8) | (p << 8));
+                }
+            }
+        }
 
         uint32_t y = ctx->y_offset + row;
         if (ctx->keep_lvgl_running) {
             /* Partition mode: synchronous blit (wait for DMA) so the next stripe
              * can reuse ctx->dma_buf — draw_bitmap is async (queue depth 10). */
-            board_display_partition_blit(x, y, x + width, y + block, ctx->dma_buf);
+            board_display_partition_blit(x, y, x + out_w, y + block, ctx->dma_buf);
         } else {
             esp_err_t ret = esp_lcd_panel_draw_bitmap(
-                panel, x, y, x + width, y + block, ctx->dma_buf);
+                panel, x, y, x + out_w, y + block, ctx->dma_buf);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "draw_bitmap failed: %s", esp_err_to_name(ret));
                 ok = false;
@@ -246,6 +278,17 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
     ctx->portrait_x = cfg ? cfg->portrait_x : 0;
     ctx->portrait_y = cfg ? cfg->portrait_y : 0;
 
+    /* 3->2 decimated blit: panel-space output = 2/3 of the (larger) source
+     * frame. Only meaningful on the dummy-draw byte-swap (SPI stripe) path;
+     * anywhere else it is ignored so a stray flag can't corrupt the blit. */
+    ctx->decimate_3to2 = cfg ? cfg->decimate_3to2 : false;
+    if (ctx->decimate_3to2 && !(use_dummy_draw && ctx->byte_swap)) {
+        ESP_LOGW(TAG, "decimate_3to2 requires dummy-draw + byte_swap; ignored");
+        ctx->decimate_3to2 = false;
+    }
+    ctx->out_w = ctx->decimate_3to2 ? (width * 2 / 3) : width;
+    ctx->out_h = ctx->decimate_3to2 ? (height * 2 / 3) : height;
+
     /* Portrait direct-blit: no LVGL widget, no DMA/cam buffer — frames go straight
      * to the panel square via the single-writer gate. The display must already be
      * in portrait-scan mode (board_display_enter_portrait_scan) and the letterbox
@@ -284,10 +327,11 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
     /* Get the display handle from the parent widget */
     ctx->disp = lv_obj_get_display(par);
 
-    /* Container fills the parent — overlay widgets are children of this */
+    /* Container fills the parent — overlay widgets are children of this.
+     * Panel-space size (out_w/out_h == width/height unless decimating). */
     ctx->container = lv_obj_create(par);
     lv_obj_remove_style_all(ctx->container);
-    lv_obj_set_size(ctx->container, width, height);
+    lv_obj_set_size(ctx->container, ctx->out_w, ctx->out_h);
     lv_obj_center(ctx->container);
 
     if (!use_dummy_draw) {
@@ -309,17 +353,19 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
     /* Dummy-draw setup: allocate DMA buffer (SPI only) and enable mode */
     if (use_dummy_draw) {
         if (ctx->byte_swap) {
-            /* SPI panels need an internal-RAM DMA buffer for byte-swap + striped blit */
+            /* SPI panels need an internal-RAM DMA buffer for byte-swap + striped
+             * blit. Stripes are sized in PANEL space (out_w == width unless the
+             * 3->2 decimation is on). */
             ctx->dma_stripe_lines = DMA_STRIPE_LINES_DEFAULT;
             /* Cap so each stripe fits in ONE aligned SPI transaction — otherwise
              * esp_lcd splits at the odd 32767-byte limit and the SPI master
              * bounce-allocates per blit, fragmenting the DMA heap → freeze. */
-            uint32_t max_single_chunk_lines = SPI_MAX_SINGLE_XFER_BYTES / (width * 2);
+            uint32_t max_single_chunk_lines = SPI_MAX_SINGLE_XFER_BYTES / (ctx->out_w * 2);
             if (max_single_chunk_lines < 1) max_single_chunk_lines = 1;
             if (ctx->dma_stripe_lines > max_single_chunk_lines)
                 ctx->dma_stripe_lines = max_single_chunk_lines;
             while (ctx->dma_stripe_lines >= DMA_STRIPE_LINES_MIN) {
-                size_t stripe_size = width * ctx->dma_stripe_lines * 2;
+                size_t stripe_size = ctx->out_w * ctx->dma_stripe_lines * 2;
                 ctx->dma_buf = heap_caps_aligned_alloc(
                     DMA_BUF_ALIGN, stripe_size,
                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -338,19 +384,20 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
                 memset(ctx->cam_buf, 0, buf_size);
             } else {
                 ESP_LOGI(TAG, "DMA stripe buffer: %"PRIu32" lines (%zu bytes, internal RAM)",
-                         ctx->dma_stripe_lines, (size_t)(width * ctx->dma_stripe_lines * 2));
+                         ctx->dma_stripe_lines,
+                         (size_t)(ctx->out_w * ctx->dma_stripe_lines * 2));
             }
         }
 
         if (ctx->dummy_draw) {
 
-            /* Calculate centering offsets */
+            /* Calculate centering offsets (panel space: out_w/out_h) */
             ctx->panel_width = lv_display_get_horizontal_resolution(ctx->disp);
             ctx->panel_height = lv_display_get_vertical_resolution(ctx->disp);
-            ctx->x_offset = (ctx->panel_width > width)
-                          ? (ctx->panel_width - width) / 2 : 0;
-            ctx->y_offset = (ctx->panel_height > height)
-                          ? (ctx->panel_height - height) / 2 : 0;
+            ctx->x_offset = (ctx->panel_width > ctx->out_w)
+                          ? (ctx->panel_width - ctx->out_w) / 2 : 0;
+            ctx->y_offset = (ctx->panel_height > ctx->out_h)
+                          ? (ctx->panel_height - ctx->out_h) / 2 : 0;
 
             /* Declared before the partition goto so the jump never skips an
              * initializer (kept ESP_OK / unused on the partition path). */
@@ -368,7 +415,8 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
                  * panel black once. (No-op stub on non-partition boards.) */
                 if (board_display_partition_begin(
                         ctx->panel_width, ctx->panel_height,
-                        ctx->x_offset, ctx->y_offset, width, height) != ESP_OK) {
+                        ctx->x_offset, ctx->y_offset,
+                        ctx->out_w, ctx->out_h) != ESP_OK) {
                     ESP_LOGE(TAG, "partition begin failed — camera preview degraded");
                 }
                 goto dummy_draw_done;
@@ -387,7 +435,7 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
                  * the next on vsync.  Repeat enough times to clear them all. */
                 uint32_t clear_lines = ctx->dma_stripe_lines ? ctx->dma_stripe_lines : 50;
                 size_t clear_buf_size = ctx->panel_width * clear_lines * 2;
-                size_t dma_buf_size = width * ctx->dma_stripe_lines * 2;
+                size_t dma_buf_size = ctx->out_w * ctx->dma_stripe_lines * 2;
                 uint8_t *clear_buf = NULL;
                 bool free_clear_buf = false;
                 if (ctx->dma_buf && clear_buf_size <= dma_buf_size) {

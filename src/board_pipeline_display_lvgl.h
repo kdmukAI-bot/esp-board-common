@@ -44,6 +44,16 @@ typedef struct {
     bool    portrait_direct;
     int32_t portrait_x;                 /**< square x offset on the portrait panel */
     int32_t portrait_y;                 /**< square y offset (e.g. 160 for 480²/800) */
+
+    /* 3->2 decimated blit (dummy-draw byte-swap path only): the pipeline frame
+     * is larger than the panel region by exactly 3/2 (e.g. 480x480 frames for
+     * the QR decoders on a 320-square panel). The blit drops every 3rd column
+     * and every 3rd row (output = width*2/3 x height*2/3; aliasing accepted —
+     * this is a decode-resolution experiment, not a rendering feature). The
+     * reserved rect / partition geometry is registered at the OUTPUT size, so
+     * gutter chrome and touch are unaffected. Ignored (with a warning) unless
+     * use_dummy_draw && byte_swap. */
+    bool decimate_3to2;
 } board_pipeline_lvgl_display_config_t;
 
 extern const cam_pipeline_display_driver_t board_pipeline_lvgl_display_driver;
