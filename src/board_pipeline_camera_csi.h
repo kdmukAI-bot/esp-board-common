@@ -21,6 +21,8 @@ typedef struct {
     int sccb_scl_pin;               /* SCCB SCL pin (used when i2c_bus is NULL) */
     int sccb_i2c_port;              /* SCCB I2C port (used when i2c_bus is NULL) */
     uint8_t ae_target;              /* Initial AE target (2-235, 0 = use driver default) */
+    bool hmirror;                   /* Flip sensor readout left<->right (V4L2_CID_HFLIP) */
+    bool vflip;                     /* Flip sensor readout top<->bottom (V4L2_CID_VFLIP) */
 } board_pipeline_csi_config_t;
 
 extern const cam_pipeline_camera_driver_t board_pipeline_csi_driver;

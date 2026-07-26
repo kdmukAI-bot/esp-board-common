@@ -16,6 +16,27 @@
 #define BOARD_CAMERA_ROTATION 0
 #endif
 
+/* Per-board camera orientation, all default off. Two mechanisms:
+ *  - Sensor readout flip (BOARD_CAMERA_HMIRROR / _VFLIP) — cleanest when the sensor
+ *    supports it, since it fixes the source so every path is correct. Preferred for
+ *    horizontal corrections (column reorder is clean).
+ *  - PPA output mirror (BOARD_CAMERA_MIRROR_X / _Y) — a corruption-free fallback for
+ *    the axis a given sensor can't flip cleanly (e.g. OV02C10's vertical flip
+ *    corrupts the frame, so a vertical correction must go through the PPA).
+ * A rotation offset is separate: BOARD_CAMERA_ROTATION. */
+#ifndef BOARD_CAMERA_HMIRROR
+#define BOARD_CAMERA_HMIRROR 0
+#endif
+#ifndef BOARD_CAMERA_VFLIP
+#define BOARD_CAMERA_VFLIP 0
+#endif
+#ifndef BOARD_CAMERA_MIRROR_X
+#define BOARD_CAMERA_MIRROR_X 0
+#endif
+#ifndef BOARD_CAMERA_MIRROR_Y
+#define BOARD_CAMERA_MIRROR_Y 0
+#endif
+
 /* Partition mode: keep LVGL running during the camera preview so live chrome
  * renders in the gutters beside the direct-blit square (SPI/dummy-draw boards
  * only). Opt-in per board — the S3 dummy-draw boards stay on the proven
@@ -75,6 +96,8 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
         .display_width  = BOARD_DISP_H_RES,
         .display_height = BOARD_DISP_V_RES,
         .rotation       = cam_rotation,
+        .mirror_x       = BOARD_CAMERA_MIRROR_X,
+        .mirror_y       = BOARD_CAMERA_MIRROR_Y,
         .display_driver = &board_pipeline_lvgl_display_driver,
         .display_config = &s_lvgl_display_config,
         .display_parent = display_parent,
@@ -111,6 +134,8 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     s_csi_config = (board_pipeline_csi_config_t){
         .i2c_bus = (i2c_master_bus_handle_t)i2c_bus,
         .ae_target = CONFIG_BOARD_CSI_AE_TARGET, /* 0 = ISP default */
+        .hmirror = BOARD_CAMERA_HMIRROR,
+        .vflip = BOARD_CAMERA_VFLIP,
     };
     config.camera_driver = &board_pipeline_csi_driver;
     config.camera_config = &s_csi_config;

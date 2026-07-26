@@ -3,7 +3,7 @@
  *
  * Display:  ST7701S MIPI-DSI 2-lane (480x800, portrait native)
  * Touch:    GT911 I2C
- * Camera:   OV02C10 MIPI-CSI 2-lane (disabled here — phase 2)
+ * Camera:   OV02C10 MIPI-CSI 2-lane
  * SoC:      ESP32-P4 (dual-core RISC-V 400MHz, 32MB PSRAM, 16MB flash)
  *
  * A near-twin of the Waveshare ESP32-P4 WiFi6 Touch LCD 4.3 (same SoC, same
@@ -99,16 +99,38 @@
 #define BOARD_ST7701_FLUSH_TASK_AFFINITY   -1  /* tskNO_AFFINITY */
 
 /* ── Camera (MIPI-CSI, OV02C10) ── */
-/* Disabled for the display+touch bring-up pass. The sensor is OV02C10 (not the
- * twin's OV5647), so enabling it needs the OV02C10 driver + CSI control pins —
- * see phase 2 in the build plan doc. */
+/* The sensor is OV02C10 (not the twin's OV5647). Its driver lives in the
+ * standalone board_common/components/ov02c10 add-on and is selected by
+ * CONFIG_CAMERA_OV02C10 in this board's sdkconfig.board. Like the twin, the
+ * module self-clocks and needs no reset/pwdn/XCLK GPIOs (esp_video is called
+ * with reset_pin/pwdn_pin = -1; XCLK is the P4 internal clock router). */
 #ifndef BOARD_HAS_CAMERA
-#define BOARD_HAS_CAMERA            0
+#define BOARD_HAS_CAMERA            1
 #endif
 #define BOARD_CAMERA_INTERFACE      CAMERA_CSI
 #define BOARD_PIN_CAM_SCCB_SDA      GPIO_NUM_7
 #define BOARD_PIN_CAM_SCCB_SCL      GPIO_NUM_8
 #define BOARD_CAM_SCCB_I2C_PORT     0   /* Shares main I2C bus */
+
+/* Camera orientation — two independent physical corrections:
+ *
+ * 1. Rotation. The camera flex is folded rearward (180° in-plane) to aim the lens
+ *    away from the user, so the image is rotated 180° vs the twin's mount (which
+ *    needs 0). Handled by BOARD_CAMERA_ROTATION.
+ *
+ * 2. Handedness. This OV02C10 module is wired as a SELFIE camera, so it reads out
+ *    horizontally mirrored by default (device-confirmed: printed text renders
+ *    backwards). This MUST be corrected in the PPA (post-ISP RGB565), not at the
+ *    sensor: OV02C10 is a RAW-Bayer sensor, so toggling its flip registers shifts
+ *    the Bayer phase and wrecks the fixed-GBRG ISP demosaic — HFLIP (0x3821) wipes
+ *    the blue/green channels, VFLIP (0x3820) corrupts the frame geometry. The PPA
+ *    mirror runs on already-demosaiced pixels, so it is clean. mirror_Y is the
+ *    correct axis: in PPA-output space it lands as a horizontal flip on the live
+ *    scan preview and a vertical flip on the app-rotated entropy still, cancelling
+ *    each path's mirror at once (device-tuned across the full mx/my table).
+ */
+#define BOARD_CAMERA_ROTATION       180
+#define BOARD_CAMERA_MIRROR_Y       1
 
 /* High-resolution image-entropy still: a SQUARE at 2x the display square
  * (min(800,480)=480 → 960 — the sensor's native 1:1 square FOV). Grabbed by a

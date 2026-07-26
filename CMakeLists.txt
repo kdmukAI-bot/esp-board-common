@@ -87,9 +87,12 @@ if(NOT IDF_TARGET STREQUAL "esp32p4")
     list(APPEND REQUIRED_COMPONENTS "espressif__esp32-camera")
 endif()
 
-# CSI camera (ESP32-P4): esp_video V4L2 layer handles CSI + ISP internally
+# CSI camera (ESP32-P4): esp_video V4L2 layer handles CSI + ISP internally.
+# ov02c10 is a standalone esp_cam_sensor add-on (the OV02C10 sensor is not in the
+# public esp_cam_sensor component); it compiles to an empty library unless the
+# board's sdkconfig sets CONFIG_CAMERA_OV02C10, so it is inert on OV5647 boards.
 if(IDF_TARGET STREQUAL "esp32p4")
-    list(APPEND REQUIRED_COMPONENTS "esp_driver_cam" "espressif__esp_cam_sensor" "esp_driver_isp" "esp_video")
+    list(APPEND REQUIRED_COMPONENTS "esp_driver_cam" "espressif__esp_cam_sensor" "esp_driver_isp" "esp_video" "ov02c10")
 endif()
 
 idf_component_register(
