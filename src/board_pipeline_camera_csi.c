@@ -62,7 +62,9 @@ typedef struct {
     size_t frame_buf_size;
     uint16_t frame_w;
     uint16_t frame_h;
-    uint8_t ae_target;
+    uint16_t ae_target;             /* fixed V4L2_CID_EXPOSURE at start; 0 = sensor default */
+    bool hmirror;
+    bool vflip;
     cam_pipeline_frame_cb_t frame_cb;
     void *user_ctx;
     TaskHandle_t task_handle;
@@ -131,6 +133,8 @@ static void *csi_init(const void *platform_config)
     if (!ctx) return NULL;
     ctx->video_fd = -1;
     ctx->ae_target = cfg->ae_target; /* 0 = use ISP default */
+    ctx->hmirror = cfg->hmirror;
+    ctx->vflip = cfg->vflip;
 
     /* Initialize esp_video with CSI config.
      * If an I2C bus handle is provided, reuse it for SCCB.
@@ -188,6 +192,35 @@ static void *csi_init(const void *platform_config)
     ESP_LOGI(TAG, "Camera format: %dx%d (pixfmt=0x%08"PRIx32", %zu bytes/frame)",
              ctx->frame_w, ctx->frame_h, fmt.fmt.pix.pixelformat,
              ctx->frame_buf_size);
+
+    /* Sensor readout orientation. A board sets hmirror/vflip when its module reads
+     * out flipped vs the pipeline geometry — e.g. the Guition JC4880P443's OV02C10
+     * ships as a selfie camera (horizontally mirrored by default); one HFLIP cancels
+     * it so it reads like the OV5647. Applied before streaming, only for a flip the
+     * board asks for, so a sensor whose correct orientation relies on its own
+     * defaults is untouched. NB: on OV02C10 the HORIZONTAL mirror (0x3821, column
+     * reorder) is clean but a VERTICAL flip (0x3820) corrupts the frame geometry —
+     * use BOARD_CAMERA_MIRROR_Y (PPA) for a vertical correction instead. */
+    if (ctx->hmirror) {
+        struct v4l2_ext_control c = { .id = V4L2_CID_HFLIP, .value = 1 };
+        struct v4l2_ext_controls cs = {
+            .ctrl_class = V4L2_CTRL_CLASS_USER, .count = 1, .controls = &c };
+        if (ioctl(ctx->video_fd, VIDIOC_S_EXT_CTRLS, &cs) < 0) {
+            ESP_LOGW(TAG, "Set sensor HMIRROR failed: errno=%d", errno);
+        } else {
+            ESP_LOGI(TAG, "Sensor HMIRROR enabled");
+        }
+    }
+    if (ctx->vflip) {
+        struct v4l2_ext_control c = { .id = V4L2_CID_VFLIP, .value = 1 };
+        struct v4l2_ext_controls cs = {
+            .ctrl_class = V4L2_CTRL_CLASS_USER, .count = 1, .controls = &c };
+        if (ioctl(ctx->video_fd, VIDIOC_S_EXT_CTRLS, &cs) < 0) {
+            ESP_LOGW(TAG, "Set sensor VFLIP failed: errno=%d", errno);
+        } else {
+            ESP_LOGI(TAG, "Sensor VFLIP enabled");
+        }
+    }
 
     /* Allocate frame buffers in PSRAM (cache-aligned for DMA) */
     const size_t cache_line = 128;

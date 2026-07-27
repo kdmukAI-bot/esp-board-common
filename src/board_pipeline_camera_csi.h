@@ -20,7 +20,12 @@ typedef struct {
     int sccb_sda_pin;               /* SCCB SDA pin (used when i2c_bus is NULL) */
     int sccb_scl_pin;               /* SCCB SCL pin (used when i2c_bus is NULL) */
     int sccb_i2c_port;              /* SCCB I2C port (used when i2c_bus is NULL) */
-    uint8_t ae_target;              /* Initial AE target (2-235, 0 = use driver default) */
+    uint16_t ae_target;             /* Fixed exposure written to V4L2_CID_EXPOSURE at start
+                                     * (raw sensor exposure register, NOT a normalized AE
+                                     * setpoint; 0 = leave the sensor/ISP default). Range is
+                                     * sensor-specific — see CONFIG_BOARD_CSI_AE_TARGET. */
+    bool hmirror;                   /* Flip sensor readout left<->right (V4L2_CID_HFLIP) */
+    bool vflip;                     /* Flip sensor readout top<->bottom (V4L2_CID_VFLIP) */
 } board_pipeline_csi_config_t;
 
 extern const cam_pipeline_camera_driver_t board_pipeline_csi_driver;

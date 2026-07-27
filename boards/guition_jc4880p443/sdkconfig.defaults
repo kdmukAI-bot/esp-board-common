@@ -1,0 +1,33 @@
+# Guition JC4880P443
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# L2 cache sizing for MIPI-DSI frame buffers in PSRAM
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+
+# FreeRTOS tick rate (needed for smooth LVGL rendering)
+CONFIG_FREERTOS_HZ=1000
+
+# Main task stack (MIPI-DSI init is deeper than SPI)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+
+# Required for some ESP32-P4 peripheral features
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# Disable power management (avoids clock gating issues with display)
+CONFIG_PM_ENABLE=n
+
+# Console: PRIMARY on the native USB Serial/JTAG. Unlike the Waveshare twin
+# (which bridges UART0 to USB via a CH343), this board exposes no USB-UART
+# bridge — its sole USB serial is the P4's built-in USB-Serial-JTAG. Making it
+# the primary console puts boot logs + the REPL on that port (enumerates as
+# /dev/ttyACM*, Espressif VID 303a). Writes are non-blocking when no host is
+# attached, so an unplugged board never stalls at boot.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
