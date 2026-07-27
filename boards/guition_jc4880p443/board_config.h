@@ -54,9 +54,20 @@
 /* NON-inverted on this board (Waveshare twin is inverted): higher LEDC duty =
  * brighter. board_backlight starts at duty 0 (off) and ramps up on set(). */
 #define BOARD_BACKLIGHT_INVERTED    0
-/* Keep the backlight lit from boot through the logo. The DPI framebuffers are
- * calloc'd (black) until the first render, so there is nothing to hide behind a
- * dark backlight — driving it on at boot just avoids a mid-boot dip. */
+/* Keep the backlight lit from boot through the logo (avoids a mid-boot dip),
+ * matching the Waveshare P4-43 twin.
+ *
+ * KNOWN COSMETIC ARTIFACT (deferred): on a COLD boot this board shows a ~3 s
+ * light-blue flash before the boot logo. That is the ST7701S panel's own output
+ * during the pre-initialisation window — after power-up but before
+ * board_display_st7701_init() runs and starts streaming the (calloc'd, black)
+ * DPI framebuffers. The twin's panel happens to show black in that same window;
+ * this one shows blue. Toggling KEEP_ON does NOT change it (verified on device):
+ * the window is before firmware controls the backlight or panel, and the
+ * backlight is already on from hardware power-up. A real fix would need to assert
+ * the panel reset (BOARD_PIN_LCD_RST) / force the backlight off from very early
+ * boot (bootloader level); judged not worth it for a cosmetic cold-boot flash.
+ * Cold-boot-only — warm/esptool resets don't reproduce it. */
 #define BOARD_BACKLIGHT_KEEP_ON_AT_BOOT   1
 
 /* ── IO Expander ── */
@@ -132,11 +143,15 @@
 #define BOARD_CAMERA_ROTATION       180
 #define BOARD_CAMERA_MIRROR_Y       1
 
-/* High-resolution image-entropy still: a SQUARE at 2x the display square
- * (min(800,480)=480 → 960 — the sensor's native 1:1 square FOV). Grabbed by a
- * second PPA pass, hashed full-resolution, shown downsampled with pillar bars.
- * P4 only (needs PPA). */
-#define BOARD_ENTROPY_STILL_DIM     960
+/* Image-entropy still: a centred SQUARE, 720x720. A widescreen still can't fill the
+ * landscape display on this board — device-proven: the camera PPA rotates 90° (this
+ * DSI panel is portrait-native; board_pipeline pre-rotates the camera to the landscape
+ * canvas), so the OV02C10's long (1288) axis maps to the display's SHORT axis and the
+ * extra field of view is vertical, not horizontal. A square is the natural fit and is
+ * rotation-invariant. 720 (not the old 960) is chosen because the frame is only 728
+ * tall: a bigger square would force the still grab to UPSCALE, which the PPA rejects
+ * ("scale does not fit in the out pic") and the capture hangs. P4 only (needs PPA). */
+#define BOARD_ENTROPY_STILL_DIM     720
 
 /* ── SD Card (4-bit SDMMC) ── */
 /* Same pins as the Waveshare twin (39–44). SD power (TF_VCC) is default-on via a

@@ -14,14 +14,21 @@ menu "Board Common"
             reflect the logical (post-rotation) dimensions.
 
     config BOARD_CSI_AE_TARGET
-        int "CSI camera auto-exposure target (0 = ISP default)"
+        int "CSI camera fixed exposure override (0 = sensor/ISP default)"
         default 0
-        range 0 235
+        range 0 1200
         help
-            Auto-exposure setpoint for the CSI (OV5647) ISP pipeline, 2-235.
-            Higher = brighter; 128 = neutral. 0 leaves the ISP/sensor default,
-            which over-exposes when scanning bright backlit screens (QR module
-            highlights clip). Set ~60-80 to dial exposure back for on-screen QR
-            scanning without dimming the source. Applied at camera start.
+            Fixed exposure applied once at camera start via V4L2_CID_EXPOSURE
+            (csi_set_ae_target in board_pipeline_camera_csi.c). Despite the name,
+            it is written STRAIGHT to the sensor's exposure register — it is not a
+            normalized AE setpoint, and there is no closed AE loop unless an ISP
+            IPA config is wired. So the useful range and "neutral" value are
+            sensor-specific:
+              - OV5647 (Waveshare P4 boards): has on-sensor AGC/AEC, so leave at 0
+                and let the sensor self-adapt.
+              - OV02C10 (Guition): no on-sensor AE and no IPA JSON, so the format
+                default (~894, of a ~1149 max) is fixed and over-bright. Set a
+                lower value to dim; higher = brighter. Tune on device.
+            0 leaves the sensor/ISP default untouched. Higher = brighter.
 
 endmenu

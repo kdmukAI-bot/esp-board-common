@@ -62,7 +62,7 @@ typedef struct {
     size_t frame_buf_size;
     uint16_t frame_w;
     uint16_t frame_h;
-    uint8_t ae_target;
+    uint16_t ae_target;             /* fixed V4L2_CID_EXPOSURE at start; 0 = sensor default */
     bool hmirror;
     bool vflip;
     cam_pipeline_frame_cb_t frame_cb;
