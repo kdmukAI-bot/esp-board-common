@@ -179,7 +179,15 @@ static const ov02c10_reginfo_t ov02c10_mipi_2lane_24Minput_1288x728_raw10_10fps[
      {0x4000, 0xc3},
      {0x4001, 0xe0},
      {0x4002, 0x00},
-     {0x4003, 0x40},
+     /* Black-level target 0x0040 (64/1024 = 16/255) -> 0. The sensor pedestal is
+      * never subtracted downstream (the ESP32-P4 ISP has a black-level block but
+      * ESP-IDF 5.5.1 ships no driver and esp_video exposes no control), so it
+      * survives into the output where the white-balance gains scale it PER CHANNEL
+      * and the gamma curve then expands it: measured +27/255 residual on red and
+      * +45/255 on blue, which is why shadows read as washed navy rather than black
+      * while highlights stay neutral. A single global black point cannot remove a
+      * per-channel offset, so remove it at the source instead. */
+     {0x4003, 0x00},
      {0x4008, 0x04},
      {0x4009, 0x23},
      {0x400a, 0x04},
