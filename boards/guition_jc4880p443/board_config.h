@@ -165,7 +165,7 @@
  * pedestal removed at source (ov02c10 register 0x4003), all three channels already
  * floor at zero, so this is a contrast toe rather than a repair. 12 measured best:
  * more contrast than 0 while crushing only 0.7% of the frame, where 18+ crushed
- * nearly 30%. See docs/guition-camera-followups.md. Tune with camera_scanner.set_tone() on a debug build.
+ * nearly 30%. See docs/knowledge/guition-jc4880p443-camera-tuning.md. Tune with camera_scanner.set_tone() on a debug build.
  * See board_pipeline_set_tone(). */
 #define BOARD_CAMERA_TONE_GAMMA_X10   22
 #define BOARD_CAMERA_TONE_BLACK_LEVEL 12

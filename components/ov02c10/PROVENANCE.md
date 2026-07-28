@@ -42,7 +42,7 @@ One further deviation, in the 1288x728 format register table
    washed navy while the white balance itself was correct. A single global black
    point cannot cancel a per-channel offset, so it is removed at source. With this
    change all three channels floor at exactly 0.000. Evidence:
-   `docs/guition-camera-followups.md` §1.
+   `docs/knowledge/guition-jc4880p443-camera-tuning.md` §1.
 
 ## IPA tuning file — `cfg/ov02c10_seedsigner_p4_eco4.json`
 
@@ -84,7 +84,7 @@ The file is verbatim from the vendor except for five deliberate deltas:
    crushing the image into a ~20-level band and giving AWB a tinted black to amplify.
    Only `agc` (exposure/gain) and `awb` (white balance) are kept — the two loops this
    sensor actually lacks in hardware. Evidence and numbers:
-   `docs/guition-camera-followups.md` §1.
+   `docs/knowledge/guition-jc4880p443-camera-tuning.md` §1.
 
 The vendor keys that `esp_ipa` 0.2.0 does **not** read are left in place so a
 future component bump picks them up: `awb.model`, `awb.range`,
