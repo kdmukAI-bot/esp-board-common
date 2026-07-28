@@ -143,6 +143,33 @@
 #define BOARD_CAMERA_ROTATION       180
 #define BOARD_CAMERA_MIRROR_Y       1
 
+/* ISP image-processing tuning ("IPA") — the sensor key inside the tuning file at
+ * board_common/components/ov02c10/cfg/. Defining this turns on esp_ipa's
+ * closed-loop auto exposure/gain and auto white balance, which this sensor cannot
+ * do for itself: the OV02C10 is RAW-Bayer with manual-only exposure and gain
+ * setters, so without a loop driving them the preview sits at one fixed exposure
+ * and one fixed (green-biased) white balance.
+ *
+ * The key deliberately differs from the sensor's reported name ("OV02C10") so
+ * that esp_video's own lookup misses and board_pipeline_camera_csi.c owns the
+ * pipeline instead — that is what lets exposure metering be re-weighted per
+ * camera session (centre-weighted for QR scanning, flat for image entropy).
+ * See that file's header comment. */
+#define BOARD_CAMERA_IPA_CONFIG_NAME "OV02C10_SS"
+
+/* ISP tone curve — one hardware LUT carrying a display gamma and a black point.
+ * Without it the ISP hands the panel linear light, which reads dim and flat, and
+ * the sensor's own black offset is never subtracted so shadows never reach zero.
+ * 2.2 is the standard display gamma; the black point is measured, not theoretical:
+ * with the sensor's own black-level
+ * pedestal removed at source (ov02c10 register 0x4003), all three channels already
+ * floor at zero, so this is a contrast toe rather than a repair. 12 measured best:
+ * more contrast than 0 while crushing only 0.7% of the frame, where 18+ crushed
+ * nearly 30%. See docs/guition-camera-followups.md. Tune with camera_scanner.set_tone() on a debug build.
+ * See board_pipeline_set_tone(). */
+#define BOARD_CAMERA_TONE_GAMMA_X10   22
+#define BOARD_CAMERA_TONE_BLACK_LEVEL 12
+
 /* Image-entropy still: a centred SQUARE, 720x720. A widescreen still can't fill the
  * landscape display on this board — device-proven: the camera PPA rotates 90° (this
  * DSI panel is portrait-native; board_pipeline pre-rotates the camera to the landscape

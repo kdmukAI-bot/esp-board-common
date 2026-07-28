@@ -144,4 +144,57 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     return config;
 }
 
+esp_err_t board_pipeline_set_ae_metering(board_cam_ae_metering_t mode)
+{
+#if BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    return board_pipeline_csi_set_ae_metering(mode);
+#else
+    /* DVP boards drive exposure on the sensor, with no metering weights to set. */
+    (void)mode;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t board_pipeline_set_ae_luma_target(uint8_t target)
+{
+#if BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    return board_pipeline_csi_set_ae_luma_target(target);
+#else
+    (void)target;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+uint8_t board_pipeline_get_ae_luma_target(void)
+{
+#if BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    return board_pipeline_csi_get_ae_luma_target();
+#else
+    return 0;
+#endif
+}
+
+esp_err_t board_pipeline_set_color(uint8_t saturation, uint8_t contrast)
+{
+#if BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    return board_pipeline_csi_set_color(saturation, contrast);
+#else
+    (void)saturation;
+    (void)contrast;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t board_pipeline_set_tone(uint8_t gamma_x10, uint8_t black_level)
+{
+#if BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    return board_pipeline_csi_set_tone(gamma_x10, black_level);
+#else
+    /* DVP boards have no ISP tone-mapping stage. */
+    (void)gamma_x10;
+    (void)black_level;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 #endif /* BOARD_HAS_CAMERA */

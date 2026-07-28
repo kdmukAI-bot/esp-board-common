@@ -91,8 +91,12 @@ endif()
 # ov02c10 is a standalone esp_cam_sensor add-on (the OV02C10 sensor is not in the
 # public esp_cam_sensor component); it compiles to an empty library unless the
 # board's sdkconfig sets CONFIG_CAMERA_OV02C10, so it is inert on OV5647 boards.
+#
+# esp_ipa is listed explicitly: esp_video takes it as an OPTIONAL PRIVATE
+# requirement, so its headers are not visible transitively, and the CSI driver
+# needs esp_ipa.h to build the runtime-retunable AGC configuration.
 if(IDF_TARGET STREQUAL "esp32p4")
-    list(APPEND REQUIRED_COMPONENTS "esp_driver_cam" "espressif__esp_cam_sensor" "esp_driver_isp" "esp_video" "ov02c10")
+    list(APPEND REQUIRED_COMPONENTS "esp_driver_cam" "espressif__esp_cam_sensor" "esp_driver_isp" "esp_video" "espressif__esp_ipa" "ov02c10")
 endif()
 
 idf_component_register(
@@ -100,6 +104,20 @@ idf_component_register(
     INCLUDE_DIRS "src"
     REQUIRES ${REQUIRED_COMPONENTS}
 )
+
+# esp_video's ISP-pipeline entry point (esp_video_isp_pipeline_init) is a linked
+# global, but its declaration lives in the component's PRIV_INCLUDE_DIRS. The CSI
+# driver calls it directly so it can supply its own IPA configuration instead of
+# the flash-resident one esp_video would look up (see board_pipeline_camera_csi.c).
+# Pull that directory in rather than re-declaring the prototype locally, so a
+# component bump that changes the signature fails the build instead of silently
+# mismatching. Harmless on boards that never compile the CSI driver.
+if(IDF_TARGET STREQUAL "esp32p4")
+    idf_component_get_property(esp_video_dir espressif__esp_video COMPONENT_DIR)
+    if(esp_video_dir)
+        target_include_directories(${COMPONENT_LIB} PRIVATE "${esp_video_dir}/private_include")
+    endif()
+endif()
 
 # Board config header: selected at build time via BOARD variable.
 # Consumer project sets BOARD_CONFIG_DIR to the directory containing board_config.h.

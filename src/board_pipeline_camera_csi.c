@@ -19,14 +19,52 @@
 
 #include "board_pipeline_camera_csi.h"
 
+/* ── Adaptive AE / AWB via the esp_ipa ISP pipeline ─────────────────────────
+ *
+ * A board opts in by defining BOARD_CAMERA_IPA_CONFIG_NAME as the sensor key in
+ * its IPA tuning JSON (see the ov02c10 component's cfg/). With it defined, this
+ * file creates the ISP pipeline itself instead of letting esp_video do it. Two
+ * reasons:
+ *
+ *  1. esp_video_init() looks a tuning file up by the sensor's OWN name and, on a
+ *     hit, hands esp_video_isp_pipeline_init() the flash-resident `const` config
+ *     straight from the generated lookup table. Nothing can retune it afterwards.
+ *     Our tuning file is therefore keyed to a name the sensor does not report, so
+ *     that lookup misses and we get to supply a RAM copy we still own.
+ *  2. Owning the copy is what makes per-session AE metering possible: esp_ipa's
+ *     AGC re-reads luma_weight_table (and the luma thresholds) from the config
+ *     pointer on EVERY frame, so writing the RAM copy between camera sessions
+ *     changes how the next session meters the scene.
+ *
+ * The one thing it caches is sum(luma_weight_table), computed once when the
+ * pipeline is created. Every profile table below must therefore sum to the same
+ * value as the table in the tuning file — enforced at runtime in
+ * csi_apply_ae_metering(). See docs/knowledge/esp32-p4-ipa-adaptive-ae-awb-ov02c10.md.
+ *
+ * A board with no tuning file (the OV5647 targets) compiles all of this out and
+ * keeps esp_video's own behaviour untouched. */
+#if defined(BOARD_CAMERA_IPA_CONFIG_NAME) && CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+#define CSI_HAS_IPA 1
+#else
+#define CSI_HAS_IPA 0
+#endif
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/ioctl.h>
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
 #include "esp_video_device.h"
+#include "esp_video_isp_ioctl.h"
+#include "driver/isp_gamma.h"
+#if CSI_HAS_IPA
+#include "esp_ipa.h"
+/* esp_video PRIVATE header — see the board_common CMakeLists note that adds it. */
+#include "esp_video_pipeline_isp.h"
+#endif
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -74,6 +112,372 @@ typedef struct {
 
 /* Forward declaration */
 static esp_err_t csi_set_ae_target(void *handle, uint32_t level);
+
+/* ── ISP tone curve: black point + display gamma ────────────────────────────
+ *
+ * The ISP's GAMMA block is BYPASSED unless something writes a curve to it —
+ * esp_video only enables it on a V4L2_CID_USER_ESP_ISP_GAMMA write. With no IPA
+ * enhancement block driving it, the pipeline hands the display LINEAR light,
+ * which reads as dim and flat: a display expects roughly sRGB-encoded input, so
+ * every midtone lands far darker than the eye expects.
+ *
+ * The same 16-point curve also fixes the black point. The sensor's own black
+ * offset is never subtracted (the ESP32-P4 ISP has a black-level block, but
+ * ESP-IDF 5.5.1 ships no driver for it and esp_video exposes no control), so the
+ * darkest pixels float around 9/255 instead of reaching zero and shadows read as
+ * washed grey. Folding the subtraction into the curve costs nothing extra and
+ * has to happen here anyway: applying gamma to an un-subtracted pedestal would
+ * LIFT it further (a 0.45 encode maps 9/255 to roughly 60/255), making the very
+ * problem worse.
+ *
+ *      y = 255 * clamp((x - black) / (255 - black), 0, 1) ^ (1 / gamma)
+ *
+ * Cost is one ioctl per camera session. The curve itself is a hardware LUT, so
+ * there is no per-frame CPU at all. */
+#ifndef BOARD_CAMERA_TONE_GAMMA_X10
+#define BOARD_CAMERA_TONE_GAMMA_X10 0   /* 0 = leave the ISP linear (no curve) */
+#endif
+#ifndef BOARD_CAMERA_TONE_BLACK_LEVEL
+#define BOARD_CAMERA_TONE_BLACK_LEVEL 0
+#endif
+
+static uint8_t s_tone_gamma_x10 = BOARD_CAMERA_TONE_GAMMA_X10;
+static uint8_t s_tone_black     = BOARD_CAMERA_TONE_BLACK_LEVEL;
+
+/* esp_isp_gamma_fill_curve_points() takes a context-free function pointer, hence
+ * the file-scope parameters above. */
+static uint32_t csi_tone_curve(uint32_t x)
+{
+    float black = (float)s_tone_black;
+    float span = 255.0f - black;
+    if (span < 1.0f) {
+        span = 1.0f;
+    }
+
+    float v = ((float)x - black) / span;
+    if (v <= 0.0f) {
+        return 0;
+    }
+    if (v > 1.0f) {
+        v = 1.0f;
+    }
+
+    float y = powf(v, 10.0f / (float)s_tone_gamma_x10) * 255.0f + 0.5f;
+    return (uint32_t)(y > 255.0f ? 255.0f : y);
+}
+
+static void csi_apply_tone_curve(void)
+{
+    int fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "Tone curve: cannot open %s (errno=%d)",
+                 ESP_VIDEO_ISP1_DEVICE_NAME, errno);
+        return;
+    }
+
+    esp_video_isp_gamma_t gamma = { .enable = s_tone_gamma_x10 > 0 };
+    if (gamma.enable) {
+        /* The hardware constrains the point spacing to powers of two; let the IDF
+         * helper place them rather than hand-rolling the x axis. */
+        isp_gamma_curve_points_t pts;
+        esp_err_t err = esp_isp_gamma_fill_curve_points(csi_tone_curve, &pts);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Tone curve: fill failed: %s", esp_err_to_name(err));
+            close(fd);
+            return;
+        }
+        for (int i = 0; i < ISP_GAMMA_CURVE_POINTS_NUM; i++) {
+            gamma.points[i].x = pts.pt[i].x;
+            gamma.points[i].y = pts.pt[i].y;
+        }
+    }
+
+    struct v4l2_ext_control ctrl = {
+        .id = V4L2_CID_USER_ESP_ISP_GAMMA,
+        .size = sizeof(gamma),
+        .p_u8 = (uint8_t *)&gamma,
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER, .count = 1, .controls = &ctrl };
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0) {
+        ESP_LOGW(TAG, "Tone curve: set failed (errno=%d)", errno);
+    } else if (gamma.enable) {
+        ESP_LOGI(TAG, "Tone curve: gamma %u.%u, black point %u",
+                 s_tone_gamma_x10 / 10, s_tone_gamma_x10 % 10, s_tone_black);
+    } else {
+        ESP_LOGI(TAG, "Tone curve: disabled (linear)");
+    }
+    close(fd);
+}
+
+/* Saturation and contrast live in the ISP's colour block — hardware, applied after
+ * the gamma LUT, 128 = neutral for both. Worth having separately from the IPA's own
+ * saturation table: that one is indexed by colour temperature and only moves when
+ * the tuning file says so, whereas this is a flat board-level trim. */
+#ifndef BOARD_CAMERA_COLOR_SATURATION
+#define BOARD_CAMERA_COLOR_SATURATION 128
+#endif
+#ifndef BOARD_CAMERA_COLOR_CONTRAST
+#define BOARD_CAMERA_COLOR_CONTRAST 128
+#endif
+
+static uint8_t s_color_saturation = BOARD_CAMERA_COLOR_SATURATION;
+static uint8_t s_color_contrast   = BOARD_CAMERA_COLOR_CONTRAST;
+
+static void csi_apply_color(void)
+{
+    if (s_color_saturation == 128 && s_color_contrast == 128) {
+        return;   /* neutral: leave the ISP defaults untouched */
+    }
+
+    int fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "Colour: cannot open %s (errno=%d)",
+                 ESP_VIDEO_ISP1_DEVICE_NAME, errno);
+        return;
+    }
+
+    struct v4l2_ext_control ctrl[2] = {
+        { .id = V4L2_CID_SATURATION, .value = s_color_saturation },
+        { .id = V4L2_CID_CONTRAST,   .value = s_color_contrast },
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER, .count = 2, .controls = ctrl };
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0) {
+        ESP_LOGW(TAG, "Colour: set failed (errno=%d)", errno);
+    } else {
+        ESP_LOGI(TAG, "Colour: saturation %u, contrast %u",
+                 s_color_saturation, s_color_contrast);
+    }
+    close(fd);
+}
+
+esp_err_t board_pipeline_csi_set_color(uint8_t saturation, uint8_t contrast)
+{
+    s_color_saturation = saturation;
+    s_color_contrast = contrast;
+    csi_apply_color();
+    return ESP_OK;
+}
+
+esp_err_t board_pipeline_csi_set_tone(uint8_t gamma_x10, uint8_t black_level)
+{
+    if (gamma_x10 && (gamma_x10 < 5 || gamma_x10 > 40)) {
+        return ESP_ERR_INVALID_ARG;   /* 0.5 .. 4.0 */
+    }
+    if (black_level > 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_tone_gamma_x10 = gamma_x10;
+    s_tone_black = black_level;
+    csi_apply_tone_curve();
+    return ESP_OK;
+}
+
+/* ── AE metering profiles ── */
+#if CSI_HAS_IPA
+
+/* Weights over the ISP's 5x5 auto-exposure region grid, row-major over the full
+ * sensor frame. BOTH tables must sum to the same total as the table in the tuning
+ * JSON (csi_apply_ae_metering enforces it) — esp_ipa's AGC caches that sum once
+ * and divides the weighted luma by it every frame, so a mismatched table would
+ * scale the measured brightness and push the exposure loop off target. */
+
+/* Whole-scene average. Flat, so a bright or dark corner pulls exactly as hard as
+ * the middle — wanted for image entropy, where the whole frame is the subject. */
+static const uint8_t k_ae_weight_average[ISP_AE_REGIONS] = {
+    3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3,
+};
+
+/* Centre-weighted: the middle 3x3 carries ~73% of the total. For QR scanning the
+ * code is held in the middle of the frame and the surround is whatever happens to
+ * be behind it — a bright desk lamp or a dark background at the edge would
+ * otherwise drag the exposure away from the one region that has to decode. The
+ * surround still contributes, so a code on a dim background does not blow out. */
+static const uint8_t k_ae_weight_center[ISP_AE_REGIONS] = {
+    1,  1,  2,  1,  1,
+    1,  4,  6,  4,  1,
+    2,  6, 15,  6,  2,
+    1,  4,  6,  4,  1,
+    1,  1,  2,  1,  1,
+};
+
+/* RAM copies handed to esp_video_isp_pipeline_init(). s_agc_cfg is the one the
+ * AGC re-reads per frame, so retuning AE means writing it in place. */
+static esp_ipa_config_t s_ipa_cfg;
+static esp_ipa_agc_config_t s_agc_cfg;
+static uint8_t s_ae_weight_tuned[ISP_AE_REGIONS];  /* the tuning file's own table */
+static uint16_t s_ae_weight_sum;                   /* the sum esp_ipa cached */
+static bool s_ipa_started = false;
+static board_cam_ae_metering_t s_ae_metering = BOARD_CAM_AE_METERING_DEFAULT;
+
+/* The tuning file's own setpoint + band, kept so an override can be undone and so
+ * the band can be rescaled in the file's proportions. */
+static uint8_t s_luma_target_tuned, s_luma_low_tuned, s_luma_high_tuned;
+static uint8_t s_luma_target_override;             /* 0 = use the tuning file's */
+
+static void csi_apply_ae_luma_target(void)
+{
+    if (!s_luma_target_override) {
+        s_agc_cfg.luma_target = s_luma_target_tuned;
+        s_agc_cfg.luma_low    = s_luma_low_tuned;
+        s_agc_cfg.luma_high   = s_luma_high_tuned;
+        return;
+    }
+
+    /* Scale the quiescent band with the setpoint so its width stays proportional —
+     * a band sized for a dark target would thrash at a bright one. esp_ipa requires
+     * luma_low < target < luma_high, so clamp to keep that true at the extremes. */
+    uint32_t t = s_luma_target_override;
+    uint32_t lo = (uint32_t)s_luma_low_tuned * t / s_luma_target_tuned;
+    uint32_t hi = (uint32_t)s_luma_high_tuned * t / s_luma_target_tuned;
+    if (lo < 3) lo = 3;
+    if (lo >= t) lo = t - 1;
+    if (hi > 252) hi = 252;
+    if (hi <= t) hi = t + 1;
+
+    s_agc_cfg.luma_target = (uint8_t)t;
+    s_agc_cfg.luma_low    = (uint8_t)lo;
+    s_agc_cfg.luma_high   = (uint8_t)hi;
+}
+
+esp_err_t board_pipeline_csi_set_ae_luma_target(uint8_t target)
+{
+    /* esp_ipa's usable setpoint range; 0 is our "revert to the tuning file" value. */
+    if (target && (target < 4 || target > 251)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_luma_target_override = target;
+    if (!s_ipa_started) {
+        return ESP_OK;  /* applied when the pipeline starts */
+    }
+    csi_apply_ae_luma_target();
+    ESP_LOGI(TAG, "AE setpoint: luma %u (band %u-%u)",
+             s_agc_cfg.luma_target, s_agc_cfg.luma_low, s_agc_cfg.luma_high);
+    return ESP_OK;
+}
+
+uint8_t board_pipeline_csi_get_ae_luma_target(void)
+{
+    return s_ipa_started ? s_agc_cfg.luma_target : 0;
+}
+
+static esp_err_t csi_apply_ae_metering(void)
+{
+    const uint8_t *table;
+    const char *name;
+
+    switch (s_ae_metering) {
+    case BOARD_CAM_AE_METERING_AVERAGE:
+        table = k_ae_weight_average; name = "average"; break;
+    case BOARD_CAM_AE_METERING_CENTER:
+        table = k_ae_weight_center;  name = "centre-weighted"; break;
+    default:
+        table = s_ae_weight_tuned;   name = "tuning-file default"; break;
+    }
+
+    uint16_t sum = 0;
+    for (int i = 0; i < ISP_AE_REGIONS; i++) {
+        sum += table[i];
+    }
+    if (sum != s_ae_weight_sum) {
+        ESP_LOGE(TAG, "AE metering table sum %u != tuning file's %u; ignoring "
+                      "(a mismatched sum mis-scales the exposure loop)",
+                 sum, s_ae_weight_sum);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* The AGC only reads this while frames are being processed, and metering is
+     * selected between camera sessions (nothing is streaming), so an in-place
+     * copy needs no lock. Worst case mid-stream is one frame metered on a mixed
+     * table, which the loop corrects on the next. */
+    if (memcmp(s_agc_cfg.luma_weight_table, table, ISP_AE_REGIONS) != 0) {
+        memcpy(s_agc_cfg.luma_weight_table, table, ISP_AE_REGIONS);
+        ESP_LOGI(TAG, "AE metering: %s", name);
+    }
+    return ESP_OK;
+}
+
+/* Create the ISP/IPA pipeline with our own configuration. Called exactly once
+ * per boot, right after esp_video_init() — the same point esp_video would have
+ * created it, had our tuning file been keyed to the sensor's own name. */
+static void csi_ipa_start(void)
+{
+    const esp_ipa_config_t *base =
+        esp_ipa_pipeline_get_config(BOARD_CAMERA_IPA_CONFIG_NAME);
+    if (!base || !base->agc) {
+        ESP_LOGE(TAG, "No IPA tuning for '%s'%s — camera runs without adaptive "
+                      "exposure or white balance",
+                 BOARD_CAMERA_IPA_CONFIG_NAME, base ? " (no agc block)" : "");
+        return;
+    }
+
+    s_ipa_cfg = *base;
+    s_agc_cfg = *base->agc;
+    s_ipa_cfg.agc = &s_agc_cfg;
+
+    memcpy(s_ae_weight_tuned, s_agc_cfg.luma_weight_table, ISP_AE_REGIONS);
+    s_ae_weight_sum = 0;
+    for (int i = 0; i < ISP_AE_REGIONS; i++) {
+        s_ae_weight_sum += s_ae_weight_tuned[i];
+    }
+    s_luma_target_tuned = s_agc_cfg.luma_target;
+    s_luma_low_tuned    = s_agc_cfg.luma_low;
+    s_luma_high_tuned   = s_agc_cfg.luma_high;
+
+    esp_video_isp_config_t isp_config = {
+        .cam_dev = ESP_VIDEO_MIPI_CSI_DEVICE_NAME,
+        .isp_dev = ESP_VIDEO_ISP1_DEVICE_NAME,
+        .ipa_config = &s_ipa_cfg,
+    };
+    esp_err_t err = esp_video_isp_pipeline_init(&isp_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ISP pipeline init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    s_ipa_started = true;
+    ESP_LOGI(TAG, "ISP pipeline running IPA '%s' (adaptive AE + AWB, "
+                  "luma target %u, metering weight sum %u)",
+             BOARD_CAMERA_IPA_CONFIG_NAME, s_agc_cfg.luma_target, s_ae_weight_sum);
+
+    /* Honour anything selected before the first camera session. */
+    csi_apply_ae_metering();
+    csi_apply_ae_luma_target();
+}
+
+esp_err_t board_pipeline_csi_set_ae_metering(board_cam_ae_metering_t mode)
+{
+    s_ae_metering = mode;
+    /* Before the pipeline exists the selection is just remembered; csi_ipa_start
+     * applies it. */
+    return s_ipa_started ? csi_apply_ae_metering() : ESP_OK;
+}
+
+#else /* !CSI_HAS_IPA */
+
+esp_err_t board_pipeline_csi_set_ae_metering(board_cam_ae_metering_t mode)
+{
+    (void)mode;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t board_pipeline_csi_set_ae_luma_target(uint8_t target)
+{
+    (void)target;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+uint8_t board_pipeline_csi_get_ae_luma_target(void)
+{
+    return 0;
+}
+
+#endif /* CSI_HAS_IPA */
 
 /* ── Capture task ── */
 
@@ -169,6 +573,16 @@ static void *csi_init(const void *platform_config)
             return NULL;
         }
         s_esp_video_inited = true;
+#if CSI_HAS_IPA
+        /* Must follow esp_video_init() (the sensor and the CSI/ISP video devices
+         * have to exist) and precede the open() below only by convention — this
+         * mirrors where esp_video creates the pipeline in its own init path. */
+        csi_ipa_start();
+#endif
+        /* After the IPA, so a tuning file that drives GAMMA itself sets the curve
+         * first and this overrides it deliberately rather than racing it. */
+        csi_apply_tone_curve();
+        csi_apply_color();
     }
 
     /* Open V4L2 device */
@@ -310,9 +724,22 @@ static esp_err_t csi_start(void *handle, cam_pipeline_frame_cb_t frame_cb,
         return ESP_FAIL;
     }
 
-    /* Apply initial AE target if configured (0 = use ISP default) */
+    /* Apply the fixed exposure if configured (0 = leave it to the sensor/ISP).
+     * Skipped when an IPA is running: this writes V4L2_CID_EXPOSURE once at
+     * stream start, and the AGC loop drives the same control every few frames,
+     * so the fixed value would simply be overwritten. Setting both is a config
+     * mistake worth surfacing. */
     if (ctx->ae_target > 0) {
-        csi_set_ae_target(ctx, ctx->ae_target);
+#if CSI_HAS_IPA
+        if (s_ipa_started) {
+            ESP_LOGW(TAG, "Ignoring fixed AE target %u: adaptive AE owns exposure "
+                          "(clear CONFIG_BOARD_CSI_AE_TARGET for this board)",
+                     ctx->ae_target);
+        } else
+#endif
+        {
+            csi_set_ae_target(ctx, ctx->ae_target);
+        }
     }
 
     ESP_LOGI(TAG, "Streaming started (capture task on core %d)", core_id);
