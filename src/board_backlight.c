@@ -1,3 +1,4 @@
+#include "board.h"
 #include "board_backlight.h"
 #include "board_config.h"
 #include "driver/ledc.h"
@@ -16,7 +17,52 @@ static const char *TAG = "backlight";
 #define BOARD_BACKLIGHT_INVERTED 0
 #endif
 
+#ifndef BOARD_BACKLIGHT_DRIVER
+#define BOARD_BACKLIGHT_DRIVER BACKLIGHT_LEDC
+#endif
+
 static uint8_t g_brightness = 0;
+
+#if BOARD_BACKLIGHT_DRIVER == BACKLIGHT_COMPANION
+
+/* Boards with no backlight GPIO: brightness is a PWM-duty register write to the
+ * companion MCU, which owns the LED driver's enable pin. The bl_pin argument is
+ * meaningless here and ignored.
+ *
+ * ORDERING: this needs a live I2C bus, so unlike the LEDC path it cannot run at
+ * the very top of board_init(). board_init() calls it after the bus and the
+ * companion MCU are up — which means the panel is dark for the first moments of
+ * bring-up regardless of BOARD_BACKLIGHT_KEEP_ON_AT_BOOT. */
+#include "board_stc8.h"
+
+void board_backlight_init(int bl_pin)
+{
+    (void)bl_pin;
+    if (!board_stc8_ready()) {
+        ESP_LOGE(TAG, "companion MCU not ready — backlight will stay dark");
+        return;
+    }
+    /* Explicitly park it off: the LED driver's enable is pulled low in hardware,
+     * but the companion MCU survives a SoC reset with its previous duty, so a
+     * warm reboot would otherwise keep the old brightness through bring-up. */
+    board_stc8_set_pwm(BOARD_STC8_PWM_LCD_BL, 0);
+    g_brightness = 0;
+}
+
+void board_backlight_set(uint8_t brightness)
+{
+    if (brightness > 100) {
+        brightness = 100;
+        ESP_LOGE(TAG, "Brightness value out of range");
+    }
+
+    g_brightness = brightness;
+    board_stc8_set_pwm(BOARD_STC8_PWM_LCD_BL, brightness);
+
+    ESP_LOGI(TAG, "LCD brightness set to %d%%", brightness);
+}
+
+#else /* BACKLIGHT_LEDC */
 
 void board_backlight_init(int bl_pin)
 {
@@ -63,6 +109,8 @@ void board_backlight_set(uint8_t brightness)
 
     ESP_LOGI(TAG, "LCD brightness set to %d%%", brightness);
 }
+
+#endif /* BOARD_BACKLIGHT_DRIVER */
 
 uint8_t board_backlight_get(void)
 {

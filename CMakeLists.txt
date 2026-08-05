@@ -7,6 +7,8 @@ set(SRC_FILES
     "src/board_display_st7796.c"
     "src/board_display_st7789.c"
     "src/board_display_st7701.c"
+    "src/board_display_rgb.c"
+    "src/board_stc8.c"
     "src/board_touch_axs15231b.c"
     "src/board_touch_ft6336.c"
     "src/board_touch_cst816d.c"

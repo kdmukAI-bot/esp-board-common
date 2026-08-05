@@ -16,6 +16,10 @@
 #define DISPLAY_ST7789      2
 #define DISPLAY_AXS15231B   3
 #define DISPLAY_ST7701      4
+/* Raw parallel RGB (no panel controller IC) driven by esp_lcd_new_rgb_panel.
+ * Used by landscape-native panels, which need none of the rotation machinery
+ * the DSI path carries — see board_display_rgb.c. */
+#define DISPLAY_RGB         5
 
 #define TOUCH_FT6336        1
 #define TOUCH_CST816D       2
@@ -26,6 +30,12 @@
 
 #define CAMERA_DVP          1
 #define CAMERA_CSI          2
+
+/* Backlight control path. LEDC is the default: a PWM channel on a board GPIO.
+ * COMPANION means the board has no backlight GPIO at all and brightness is a
+ * register write to an on-board companion MCU (see board_stc8.c). */
+#define BACKLIGHT_LEDC      1
+#define BACKLIGHT_COMPANION 2
 
 /* ── Resolution (set in board_init.c from board_config.h) ── */
 #ifdef __cplusplus

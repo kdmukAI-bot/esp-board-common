@@ -41,6 +41,13 @@
 #include "board_display_st7789.h"
 #elif BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
 #include "board_display_st7701.h"
+#elif BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+#include "board_display_rgb.h"
+#include "esp_lcd_panel_ops.h"
+#endif
+
+#if defined(BOARD_HAS_COMPANION_MCU) && BOARD_HAS_COMPANION_MCU
+#include "board_stc8.h"
 #endif
 
 #if BOARD_TOUCH_DRIVER == TOUCH_AXS15231B
@@ -86,9 +93,24 @@ esp_lcd_touch_handle_t board_get_touch_handle(void) { return touch_handle; }
  * gutters. See board_display_set_reserved_rect() in board.h. Registered only on
  * the standard-SPI display path (the partition-capable panels). ── */
 
+/* Whether board_init() has to ROTATE the panel to produce a landscape canvas.
+ * True for every portrait-native panel here. False for a landscape-native one
+ * (parallel RGB), where LVGL, the panel and the touch controller already agree
+ * on the same landscape resolution — so both the display swap and the touch
+ * swap_xy/mirror transform must be skipped, not just one of them. */
+#if BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+#define BOARD_DISPLAY_ROTATES_TO_LANDSCAPE 0
+#else
+#define BOARD_DISPLAY_ROTATES_TO_LANDSCAPE 1
+#endif
+
 /* The standard-SPI display path (partial-update, MADCTL) — the only one that
- * partitions the panel and registers the invalidate-area guard below. */
-#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && !BOARD_DISPLAY_QUIRK_RASET_BUG
+ * partitions the panel and registers the invalidate-area guard below. Neither
+ * the DSI nor the parallel-RGB panel has a MADCTL or a per-flush bus to fence:
+ * both stream a framebuffer continuously. */
+#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && \
+    BOARD_DISPLAY_DRIVER != DISPLAY_RGB && \
+    !BOARD_DISPLAY_QUIRK_RASET_BUG
 #define BOARD_DISPLAY_STD_SPI 1
 #else
 #define BOARD_DISPLAY_STD_SPI 0
@@ -1035,6 +1057,27 @@ void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
 { (void)x1; (void)y1; (void)x2; (void)y2; (void)buf; }
 #endif
 
+#if BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+/* Copy one rendered region into the RGB panel's framebuffer.
+ *
+ * There is no bus and no DMA completion to wait for: an RGB panel's pixels come
+ * from a framebuffer the peripheral scans continuously, so draw_bitmap is a
+ * synchronous copy and the flush is done the moment it returns.
+ *
+ * NO byte swap, unlike the SPI panels. LVGL stores RGB565 little-endian (blue
+ * in the low bits) and the RGB peripheral reads the framebuffer as little-endian
+ * 16-bit words with data line 0 as the LSB — which this board wires to B3. The
+ * two already agree. (The vendor BSP does set swap_bytes for this panel; if
+ * colours come up wrong, that is the first knob to try, and this comment is
+ * wrong.) */
+static void rgb_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1,
+                              area->x2 + 1, area->y2 + 1, px_map);
+    lv_display_flush_ready(disp);
+}
+#endif
+
 /* ── IO Expander ── */
 #if BOARD_HAS_IO_EXPANDER
 static void io_expander_init(i2c_master_bus_handle_t bus)
@@ -1078,6 +1121,15 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
      * RASET / standard SPI: LVGL sees rotated dimensions; the flush
      *   callback or MADCTL handles the physical transformation. */
     int lvgl_hres, lvgl_vres;
+#if BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+    /* Landscape-native panel: the physical dimensions ARE the logical ones, so
+     * the swap below never applies. The caller still asks for landscape (every
+     * board does — display_manager always passes landscape=true), it just costs
+     * nothing here because the panel needs no rotation. */
+    (void)landscape;
+    lvgl_hres = BOARD_LCD_H_RES;
+    lvgl_vres = BOARD_LCD_V_RES;
+#else
     if (landscape) {
         lvgl_hres = BOARD_LCD_V_RES;
         lvgl_vres = BOARD_LCD_H_RES;
@@ -1085,6 +1137,7 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         lvgl_hres = BOARD_LCD_H_RES;
         lvgl_vres = BOARD_LCD_V_RES;
     }
+#endif
 
     /* ── Register display ── */
 #if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
@@ -1194,6 +1247,53 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         *disp_out = lvgl_port_add_disp_dsi(&disp_cfg, &dsi_cfg);
     }
 
+#elif BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+    /* Parallel RGB: create the LVGL display directly rather than through
+     * esp_lvgl_port.
+     *
+     * WHY NOT lvgl_port_add_disp_rgb(): despite the name, that helper is
+     * ESP32-S3-only. On any other target it hits an
+     * `ESP_RETURN_ON_FALSE(false, NULL, ... "RGB is supported only on ESP32S3")`
+     * and returns NULL — after having already created the display internally,
+     * so the caller silently loses the handle. Its tear-avoidance path is worse
+     * on the P4: it fetches framebuffers with esp_lcd_dpi_panel_get_frame_buffer
+     * (the MIPI-DSI accessor) because it assumes P4 implies DSI. Checked in
+     * esp_lvgl_port 2.7.2 and in the 2.6.2 the board vendor ships; the vendor's
+     * own firmware runs with tearing-avoidance and direct mode BOTH OFF, which
+     * is the configuration mirrored here.
+     *
+     * So: ordinary partial-mode draw buffers, and a flush that copies the
+     * region into the panel's PSRAM framebuffer. esp_lcd_panel_draw_bitmap() is
+     * a synchronous memcpy for an RGB panel (there is no bus transaction to
+     * wait on — the peripheral scans that framebuffer out continuously), so the
+     * flush can report ready immediately. No rotation, no deferred flush task.
+     *
+     * Trade-off: a partial copy into the live framebuffer can tear. Acceptable
+     * for bring-up; the tear-free upgrade is to render into two framebuffers
+     * directly and switch them on VSYNC (raise BOARD_RGB_NUM_FBS with it). */
+    {
+        size_t buf_px = (size_t)lvgl_hres * (lvgl_vres / 8);
+        void *buf1 = heap_caps_malloc(buf_px * sizeof(lv_color16_t), MALLOC_CAP_SPIRAM);
+        void *buf2 = heap_caps_malloc(buf_px * sizeof(lv_color16_t), MALLOC_CAP_SPIRAM);
+        assert(buf1 && buf2);
+
+        lvgl_port_lock(0);
+        lv_display_t *disp = lv_display_create(lvgl_hres, lvgl_vres);
+        lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+        lv_display_set_buffers(disp, buf1, buf2, buf_px * sizeof(lv_color16_t),
+                               LV_DISPLAY_RENDER_MODE_PARTIAL);
+        lv_display_set_flush_cb(disp, rgb_flush_cb);
+        /* LVGL's default screen is WHITE and this panel scans its framebuffer
+         * out continuously, so paint black before the handler task can flush —
+         * otherwise the backlight comes up on a white flash. Same reasoning as
+         * the DSI branch below; we still hold the port lock that task needs. */
+        lv_obj_set_style_bg_color(lv_display_get_screen_active(disp),
+                                  lv_color_black(), LV_PART_MAIN);
+        lvgl_port_unlock();
+
+        *disp_out = disp;
+    }
+
 #elif BOARD_DISPLAY_QUIRK_RASET_BUG
     /* RASET boards: full-frame direct mode with custom flush callback.
      * Don't pass io_handle — we register our own IO callback below. */
@@ -1260,7 +1360,7 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     assert(*disp_out != NULL);
 
     /* ── Panel MADCTL for standard SPI boards ── */
-#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && !BOARD_DISPLAY_QUIRK_RASET_BUG
+#if BOARD_DISPLAY_STD_SPI
     /* Landscape mirror axes are per-board: the swap_xy+mirror pair selects one
      * of the two 180°-apart landscape orientations, and which one is "up"
      * depends on the panel's native scan direction. Boards where the default
@@ -1460,6 +1560,10 @@ static void cp2_camera_portrait_task(void *arg)
 #define BOARD_BACKLIGHT_KEEP_ON_AT_BOOT 0
 #endif
 
+#ifndef BOARD_BACKLIGHT_DRIVER
+#define BOARD_BACKLIGHT_DRIVER BACKLIGHT_LEDC
+#endif
+
 int board_init(const board_app_config_t *app_cfg,
                lv_display_t **disp, lv_indev_t **touch_indev)
 {
@@ -1481,10 +1585,16 @@ int board_init(const board_app_config_t *app_cfg,
      * feedback and never sees a mid-boot dip (it previously lit at plug-in, snapped
      * off when the PWM was configured, then came back on with the logo). Holding it
      * on through init is only safe because the white-flash fix guarantees no white
-     * frame is ever produced during bring-up. */
+     * frame is ever produced during bring-up.
+     *
+     * COMPANION-MCU boards are the exception: their backlight lives behind I2C,
+     * which does not exist yet at this point, so their init is deferred to step
+     * 1b below. */
+#if BOARD_BACKLIGHT_DRIVER != BACKLIGHT_COMPANION
     board_backlight_init(BOARD_PIN_LCD_BL);
 #if BOARD_BACKLIGHT_KEEP_ON_AT_BOOT
     board_backlight_set(100);
+#endif
 #endif
 
     /* Step 0: Radio co-processor hold-in-reset (air gap).
@@ -1515,6 +1625,20 @@ int board_init(const board_app_config_t *app_cfg,
     i2c_master_bus_handle_t i2c_bus = board_i2c_init(
         BOARD_PIN_I2C_SDA, BOARD_PIN_I2C_SCL, BOARD_I2C_PORT);
 
+    /* Step 1b: Companion MCU + the backlight it owns.
+     * On these boards several control lines (backlight, panel/camera resets)
+     * are registers on a small on-board MCU rather than SoC GPIOs, so nothing
+     * that depends on them can happen before the I2C bus exists. */
+#if defined(BOARD_HAS_COMPANION_MCU) && BOARD_HAS_COMPANION_MCU
+    board_stc8_init(i2c_bus);
+#endif
+#if BOARD_BACKLIGHT_DRIVER == BACKLIGHT_COMPANION
+    board_backlight_init(BOARD_PIN_LCD_BL);
+#if BOARD_BACKLIGHT_KEEP_ON_AT_BOOT
+    board_backlight_set(100);
+#endif
+#endif
+
     /* Step 2: IO expander (if present — resets display hardware) */
 #if BOARD_HAS_IO_EXPANDER
     io_expander_init(i2c_bus);
@@ -1535,6 +1659,8 @@ int board_init(const board_app_config_t *app_cfg,
                                BOARD_LCD_H_RES * BOARD_LCD_V_RES * sizeof(lv_color16_t));
 #elif BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
     board_display_st7701_init(&io_handle, &panel_handle);
+#elif BOARD_DISPLAY_DRIVER == DISPLAY_RGB
+    board_display_rgb_init(&io_handle, &panel_handle);
 #endif
 
     /* Step 4: PMIC (if present — after display is fully initialized) */
@@ -1578,11 +1704,18 @@ int board_init(const board_app_config_t *app_cfg,
     touch_handle = board_touch_cst816d_init(i2c_bus, touch_x_max, touch_y_max);
 #elif BOARD_TOUCH_DRIVER == TOUCH_GT911
     touch_handle = board_touch_gt911_init(i2c_bus, touch_x_max, touch_y_max);
+    /* The transform corrects for the DISPLAY being rotated, not for the app
+     * wanting landscape — so it is gated on the rotation, not on `landscape`.
+     * On a landscape-native panel the controller already reports coordinates in
+     * the same space LVGL renders, and applying this would swap the axes into a
+     * 480x800 space the display does not have. */
+#if BOARD_DISPLAY_ROTATES_TO_LANDSCAPE
     if (landscape) {
         touch_handle->config.flags.swap_xy = 1;
         touch_handle->config.flags.mirror_x = 0;
         touch_handle->config.flags.mirror_y = 1;
     }
+#endif
 #endif
 
     /* Backlight PWM was configured to its off state at the top of board_init
