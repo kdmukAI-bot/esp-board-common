@@ -44,6 +44,7 @@
 #elif BOARD_DISPLAY_DRIVER == DISPLAY_RGB
 #include "board_display_rgb.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_rgb.h"   /* esp_lcd_rgb_panel_get_frame_buffer (direct mode) */
 #endif
 
 #if defined(BOARD_HAS_COMPANION_MCU) && BOARD_HAS_COMPANION_MCU
@@ -1072,8 +1073,26 @@ void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
  * wrong.) */
 static void rgb_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+#if BOARD_RGB_NUM_FBS >= 2
+    /* DIRECT mode: px_map already points INTO one of the panel's own framebuffers,
+     * because LVGL was handed those as its draw buffers. So there is nothing to
+     * copy — esp_lcd_panel_draw_bitmap() recognises the pointer as one of its
+     * framebuffers and just switches cur_fb_index to it.
+     *
+     * Only switch on the LAST area of a refresh: LVGL calls this once per dirty
+     * region, and swapping mid-refresh would publish a half-drawn frame. The
+     * earlier regions need no action at all — they were rendered straight into the
+     * off-screen buffer, which is the whole point. */
+    if (lv_display_flush_is_last(disp)) {
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, BOARD_LCD_H_RES, BOARD_LCD_V_RES, px_map);
+    }
+    (void)area;
+#else
+    /* Single framebuffer: px_map is LVGL scratch, so this is a real CPU copy into
+     * the framebuffer the peripheral is currently scanning (and can tear). */
     esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px_map);
+#endif
     lv_display_flush_ready(disp);
 }
 #endif
@@ -1090,6 +1109,13 @@ static void io_expander_init(i2c_master_bus_handle_t bus)
     ESP_ERROR_CHECK(esp_io_expander_set_level(expander_handle, BOARD_IO_EXPANDER_RST_PIN, 1));
     vTaskDelay(pdMS_TO_TICKS(200));
 }
+#endif
+
+/* Fleet default for the LVGL task stack: PSRAM, preserving the behaviour every
+ * board shipped with. A board overrides this to MALLOC_CAP_INTERNAL when it has
+ * actually been seen to panic on it — see the note at the assignment below. */
+#ifndef BOARD_LVGL_TASK_STACK_CAPS
+#define BOARD_LVGL_TASK_STACK_CAPS  MALLOC_CAP_SPIRAM
 #endif
 
 /* ── LVGL port setup ── */
@@ -1112,7 +1138,20 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     port_cfg.task_affinity    = BOARD_LVGL_TASK_AFFINITY;
     port_cfg.timer_period_ms  = BOARD_LVGL_TIMER_PERIOD_MS;
     port_cfg.task_max_sleep_ms = BOARD_LVGL_MAX_SLEEP_MS;
-    port_cfg.task_stack_caps  = MALLOC_CAP_SPIRAM;
+    /* Where the LVGL handler task's STACK lives. PSRAM keeps 16 KB off the
+     * fragmented internal heap, which is why it is the fleet default — but it is
+     * only safe while that task never runs during a cache-disabled window.
+     * It does: flash writes (settings/NVS) disable the cache, and a task whose
+     * stack is in PSRAM then cannot read its own stack. The failure is not a clean
+     * fault — the stack reads back as ZEROS, so the task returns to address 0 or
+     * loads a garbage pointer, surfacing as assorted unrelated-looking panics
+     * (instruction-access fault, load fault, interrupt WDT) that all happen to sit
+     * in taskLVGL. Device-confirmed on the Elecrow: four boot panics in a row, the
+     * coredump showing taskLVGL with ra/fp/s1/s3 all zero and SP in PSRAM.
+     * IDF's own TCB allocation is unaffected — xTaskCreateWithCaps() takes the TCB
+     * from pvPortMalloc() (always internal) and applies these caps only to the stack.
+     * Per board so a board that has actually been exercised this way can keep PSRAM. */
+    port_cfg.task_stack_caps  = BOARD_LVGL_TASK_STACK_CAPS;
     ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
     /* Determine LVGL display dimensions based on orientation.
@@ -1262,16 +1301,34 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
      * own firmware runs with tearing-avoidance and direct mode BOTH OFF, which
      * is the configuration mirrored here.
      *
-     * So: ordinary partial-mode draw buffers, and a flush that copies the
-     * region into the panel's PSRAM framebuffer. esp_lcd_panel_draw_bitmap() is
-     * a synchronous memcpy for an RGB panel (there is no bus transaction to
-     * wait on — the peripheral scans that framebuffer out continuously), so the
-     * flush can report ready immediately. No rotation, no deferred flush task.
+     * So the display is built by hand. With BOARD_RGB_NUM_FBS >= 2 that means
+     * LVGL DIRECT mode over the panel's own framebuffers: LVGL renders into the
+     * off-screen one and the flush swaps which buffer the peripheral scans, so a
+     * repaint costs no copy and cannot tear. The single-framebuffer path below it
+     * is the bring-up fallback — partial-mode scratch buffers plus a real CPU copy
+     * into the live framebuffer, which both costs ~768 KB of extra PSRAM traffic
+     * per full repaint and can tear.
      *
-     * Trade-off: a partial copy into the live framebuffer can tear. Acceptable
-     * for bring-up; the tear-free upgrade is to render into two framebuffers
-     * directly and switch them on VSYNC (raise BOARD_RGB_NUM_FBS with it). */
+     * Either way esp_lcd_panel_draw_bitmap() returns synchronously (there is no
+     * bus transaction to wait on — the peripheral scans the framebuffer out
+     * continuously), so the flush reports ready immediately. No rotation, no
+     * deferred flush task. */
     {
+#if BOARD_RGB_NUM_FBS >= 2
+        /* DIRECT mode: hand LVGL the panel's OWN framebuffers as its draw buffers,
+         * so rendering lands in the off-screen one and the flush is a pointer swap
+         * rather than a 768 KB copy. No scratch buffers are allocated at all. */
+        void *fb0 = NULL, *fb1 = NULL;
+        ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &fb0, &fb1));
+        size_t buf_bytes = (size_t)lvgl_hres * lvgl_vres * sizeof(lv_color16_t);
+
+        lvgl_port_lock(0);
+        lv_display_t *disp = lv_display_create(lvgl_hres, lvgl_vres);
+        lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+        lv_display_set_buffers(disp, fb0, fb1, buf_bytes,
+                               LV_DISPLAY_RENDER_MODE_DIRECT);
+        lv_display_set_flush_cb(disp, rgb_flush_cb);
+#else
         size_t buf_px = (size_t)lvgl_hres * (lvgl_vres / 8);
         void *buf1 = heap_caps_malloc(buf_px * sizeof(lv_color16_t), MALLOC_CAP_SPIRAM);
         void *buf2 = heap_caps_malloc(buf_px * sizeof(lv_color16_t), MALLOC_CAP_SPIRAM);
@@ -1283,6 +1340,7 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         lv_display_set_buffers(disp, buf1, buf2, buf_px * sizeof(lv_color16_t),
                                LV_DISPLAY_RENDER_MODE_PARTIAL);
         lv_display_set_flush_cb(disp, rgb_flush_cb);
+#endif
         /* LVGL's default screen is WHITE and this panel scans its framebuffer
          * out continuously, so paint black before the handler task can flush —
          * otherwise the backlight comes up on a white flash. Same reasoning as

@@ -45,14 +45,40 @@
 #define BOARD_RGB_VBP           16
 #define BOARD_RGB_VFP           16
 
-/* ONE PSRAM framebuffer (768 KB at 800x480x2) + a 20-line bounce buffer. Cheap
- * next to the portrait DSI boards, which additionally carry rotation buffers.
+/* TWO PSRAM framebuffers (768 KB each at 800x480x2) + a 20-line bounce buffer.
+ * 1.5 MB against 32 MB of PSRAM, and it REPLACES rather than adds: LVGL now
+ * renders straight into these instead of into its own ~188 KB of scratch draw
+ * buffers, so nothing lands in internal RAM either way.
  *
- * One, not two: the flush copies each rendered region into the framebuffer the
- * peripheral is currently scanning (esp_lcd_panel_draw_bitmap writes to
- * fbs[cur_fb_index] for any buffer that isn't itself a framebuffer), so a
- * second one would sit untouched. Raise this to 2 only together with the
- * tear-free rework — render into the framebuffers and switch them on VSYNC. */
+ * Why two. With one framebuffer LVGL had to render into scratch and the flush
+ * then copied that region into the buffer the peripheral was scanning — every
+ * full-screen repaint paid ~768 KB of rendering PLUS ~768 KB of PSRAM-to-PSRAM
+ * copy, while the panel was already re-reading the whole framebuffer ~59 times a
+ * second. Measured cost: 8 flushes and 28-70 ms per full repaint.
+ *
+ * With two, LVGL renders directly into the off-screen framebuffer and the flush
+ * hands its address to esp_lcd_panel_draw_bitmap, which recognises the pointer as
+ * one of its own framebuffers and simply switches cur_fb_index (see
+ * esp_lcd_panel_rgb.c) — a pointer swap instead of a copy, and tear-free because
+ * the switch takes effect on the next scan. */
+/* ⚠ HELD AT 1 — the direct-mode path below it works and is much faster, but is NOT
+ * yet safe. Do not raise this to 2 without reading the following.
+ *
+ * Measured, same build, only this macro differing, 5 boots x 13 s each:
+ *   1 (partial): 0 panics.  full repaint = 8 flushes, avg render 23 ms
+ *   2 (direct):  3 panics.  full repaint = 1 flush,  avg render  8 ms
+ * So direct mode is a ~3x render win AND it destabilises something: the panics are
+ * load faults inside mp_map_lookup() / mp_load_method() on the MicroPython task —
+ * i.e. the MP heap, not the display. Suspected same root cause as an intermittent
+ * "NameError: name 'X' isn't defined" seen in the app, which is what a corrupted
+ * map lookup looks like when it merely misses instead of faulting.
+ *
+ * Ruled out already: the 0,0,800x480 bounds are correct for this landscape-native
+ * panel; IDF does support num_fbs=2 alongside a bounce buffer; the buffer size
+ * handed to LVGL (800*480*2) matches IDF's own fb_size.
+ * Next suspect to test: the flush passes the FULL screen to
+ * esp_lcd_panel_draw_bitmap(), so every frame triggers a 768 KB cache write-back;
+ * scoping that to the dirty area is the next experiment. */
 #define BOARD_RGB_NUM_FBS               1
 #define BOARD_RGB_BOUNCE_BUFFER_LINES   20
 
@@ -152,43 +178,83 @@
  * boards. */
 #define BOARD_LVGL_TASK_PRIORITY    1
 #define BOARD_LVGL_TASK_STACK       (1024 * 16)
+/* Stack in INTERNAL RAM, overriding the fleet's PSRAM default. Device-confirmed
+ * necessary here: with the stack in PSRAM this board panicked on four consecutive
+ * boots, always in taskLVGL, and the coredump showed its registers reading back as
+ * zeros — a PSRAM stack being read while a flash write had the cache disabled.
+ * Costs 16 KB of internal RAM, which is deliberate and small; the fragmentation
+ * work that pushed big allocations to PSRAM is unaffected (the ~188 KB of LVGL
+ * draw buffers and the camera's buffers all stay in PSRAM). */
+#define BOARD_LVGL_TASK_STACK_CAPS  MALLOC_CAP_INTERNAL
 #define BOARD_LVGL_TASK_AFFINITY    -1  /* No core affinity */
 #define BOARD_LVGL_MAX_SLEEP_MS     500
 #define BOARD_LVGL_TIMER_PERIOD_MS  5
 
 /* ── Camera (MIPI-CSI, SC2336) ── */
-/* The module IS populated on our unit and the sensor is a SmartSens SC2336
- * (2 MP 1280x720): SCCB answers at 0x30 and chip-ID 0x3107/0x3108 reads 0xCB3A.
- * Still OFF here — enabling it is phase 4 and needs CONFIG_CAMERA_SC2336 plus
- * the ISP/IPA work, not just this flag.
+/* The sensor is a SmartSens SC2336 (2 MP 1280x720): SCCB answers at 0x30 and
+ * chip-ID 0x3107/0x3108 reads 0xCB3A. The driver ships in esp_cam_sensor, so
+ * unlike the Guition's OV02C10 there is no add-on component; it is selected by
+ * CONFIG_CAMERA_SC2336 in this board's sdkconfig.board.
  *
- * Four things differ from the rest of the fleet when it is turned on:
- *   - SCCB is its own I2C bus at 1.8V, not the main one
- *   - the sensor reset is a companion-MCU line (BOARD_STC8_OUT_CSI_RST), not a
- *     GPIO — and the companion MCU releases it by default
- *   - XVCLK comes from a dedicated 24 MHz oscillator, so there is no clock to drive
- *   - the sensor is RAW-Bayer with manual exposure/gain, so it needs esp_ipa's
- *     closed loop for AE/AWB (as the Guition's OV02C10 does)
+ * Four things differ from the rest of the fleet:
+ *   - SCCB is its own I2C bus, not the main one. The P4 pins are ordinary 3.3 V
+ *     IO (pulled up to VDDPST_5); BSS138 shifters Q6/Q7, gated on DOVDD_1V8, put
+ *     only the SENSOR side at 1.8 V, so nothing here needs a special IO voltage.
+ *   - the sensor reset is a companion-MCU line (STC8 P1.3), not a GPIO — and the
+ *     companion MCU releases it by default, so firmware never has to touch it
+ *     (the sensor answers SCCB from a cold boot).
+ *   - XVCLK comes from a dedicated 24 MHz oscillator, so no XCLK pin is driven.
+ *   - the sensor is RAW-Bayer with manual exposure/gain, so it needs a closed
+ *     loop for AE/AWB. Unlike the OV02C10 this one comes for free: esp_cam_sensor
+ *     ships cfg/sc2336_default.json keyed "SC2336", which is the sensor's own
+ *     reported name, so esp_video's lookup hits it and builds the ISP pipeline
+ *     itself. BOARD_CAMERA_IPA_CONFIG_NAME is therefore deliberately NOT defined
+ *     here — defining it would take ownership of the pipeline (for per-session AE
+ *     metering) and require our own copy of the tuning file.
  */
 #ifndef BOARD_HAS_CAMERA
-#define BOARD_HAS_CAMERA            0
+#define BOARD_HAS_CAMERA            1
 #endif
 #define BOARD_CAMERA_INTERFACE      CAMERA_CSI
 #define BOARD_PIN_CAM_SCCB_SDA      GPIO_NUM_33
 #define BOARD_PIN_CAM_SCCB_SCL      GPIO_NUM_34
 #define BOARD_CAM_SCCB_I2C_PORT     1   /* Dedicated bus — NOT the main I2C */
 
+/* Camera orientation. This panel is landscape-native, so unlike the DSI boards there
+ * is no display-rotation term folded in — board_pipeline.c passes BOARD_CAMERA_ROTATION
+ * through unchanged, and the value here is a pure camera-to-panel MOUNT offset.
+ *
+ * 180: device-observed. The module is mounted inverted relative to the panel, so the
+ * preview came up upside down with no rotation applied. No mirror correction is
+ * applied — the image reads the right way round, it was only inverted, which a 180
+ * rotation alone fixes (a mirrored mount would need BOARD_CAMERA_MIRROR_Y as well,
+ * and on a RAW-Bayer sensor that correction must go through the PPA, not the sensor's
+ * own flip registers — see the Guition notes on Bayer-phase damage). */
+#define BOARD_CAMERA_ROTATION       180
+
+/* Image-entropy still: a centred SQUARE. The frame is 1280x720, so 720 is the
+ * largest square the sensor can supply; anything bigger would force the grab to
+ * UPSCALE, which the PPA rejects ("scale does not fit in the out pic") and the
+ * capture hangs. P4 only (needs PPA). */
+#define BOARD_ENTROPY_STILL_DIM     720
+
 /* ── SD Card (1-bit SDMMC) ── */
 /* Same CLK/CMD/D0 pins as the rest of the P4 fleet, but ONE bit wide: DAT1-3
  * terminate on pull-ups at the socket and are not routed to the SoC, so a
- * 4-bit configuration cannot work here. Enabled in phase 3. */
+ * 4-bit configuration cannot work here. */
 #ifndef BOARD_HAS_SDCARD
-#define BOARD_HAS_SDCARD            0
+#define BOARD_HAS_SDCARD            1
 #endif
 #define BOARD_SD_WIDTH              1
 #define BOARD_PIN_SD_CLK            GPIO_NUM_43
 #define BOARD_PIN_SD_CMD            GPIO_NUM_44
 #define BOARD_PIN_SD_D0             GPIO_NUM_39
+/* No on-chip LDO for the SD rail on this board, unlike the rest of the P4 fleet.
+ * The card's VDD comes straight off the board's VDD_3V3 (J5.VDD), and the SoC IO
+ * domain carrying CLK/CMD/D0 (VDDPST_5) is bridged to that same rail by R25 (0R).
+ * The LDO4 feedback link R109 is NC — the on-chip regulator's output reaches only a
+ * decoupling cap. Acquiring an LDO channel here would regulate nothing, so 0. */
+#define BOARD_SD_PWR_LDO_CHAN       0
 
 /* ── Audio (NS4168) ── */
 /* Amp shutdown is a companion-MCU line (BOARD_STC8_OUT_AUDIO_SD). Unused. */
