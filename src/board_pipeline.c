@@ -131,8 +131,24 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     config.camera_config = &s_dvp_config;
 
 #elif BOARD_CAMERA_INTERFACE == CAMERA_CSI
+    /* SCCB bus: most boards hang the sensor off the SAME I2C bus as touch/PMIC, so
+     * the already-open main bus handle is reused. A board can instead give the
+     * sensor its own bus (the Elecrow CrowPanel P4 5" puts SCCB on I2C1/GPIO33-34,
+     * behind level shifters, so it never appears on the main bus). There, passing
+     * the main handle would probe the sensor's address on the wrong pins and the
+     * detect NACKs — so hand over the pins instead and let esp_video open it. */
+#if BOARD_CAM_SCCB_I2C_PORT != BOARD_I2C_PORT
+    (void)i2c_bus; /* main bus not used for SCCB on this board */
+#endif
     s_csi_config = (board_pipeline_csi_config_t){
+#if BOARD_CAM_SCCB_I2C_PORT == BOARD_I2C_PORT
         .i2c_bus = (i2c_master_bus_handle_t)i2c_bus,
+#else
+        .i2c_bus = NULL,                 /* dedicated bus — esp_video opens it */
+        .sccb_i2c_port = BOARD_CAM_SCCB_I2C_PORT,
+        .sccb_sda_pin = BOARD_PIN_CAM_SCCB_SDA,
+        .sccb_scl_pin = BOARD_PIN_CAM_SCCB_SCL,
+#endif
         .ae_target = CONFIG_BOARD_CSI_AE_TARGET, /* 0 = ISP default */
         .hmirror = BOARD_CAMERA_HMIRROR,
         .vflip = BOARD_CAMERA_VFLIP,

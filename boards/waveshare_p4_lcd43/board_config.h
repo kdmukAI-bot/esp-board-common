@@ -114,6 +114,9 @@
 #define BOARD_PIN_SD_D1             GPIO_NUM_40
 #define BOARD_PIN_SD_D2             GPIO_NUM_41
 #define BOARD_PIN_SD_D3             GPIO_NUM_42
+/* The SD rail hangs off on-chip LDO channel 4 (LDO_VO4 → SDMMC IO), per the
+ * Waveshare BSP. machine.SDCard cannot enable it, so the C boot must. */
+#define BOARD_SD_PWR_LDO_CHAN       4
 
 /* ── Audio (ES8311 + ES7210) ── */
 #ifndef BOARD_HAS_AUDIO

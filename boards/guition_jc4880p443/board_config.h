@@ -193,6 +193,10 @@
 #define BOARD_PIN_SD_D1             GPIO_NUM_40
 #define BOARD_PIN_SD_D2             GPIO_NUM_41
 #define BOARD_PIN_SD_D3             GPIO_NUM_42
+/* Card VDD is default-on (above), but the SoC IO domain carrying the SDMMC pins
+ * still takes on-chip LDO channel 4, as on the Waveshare twin. Kept at the fleet
+ * value: this board has been working with the channel acquired since bring-up. */
+#define BOARD_SD_PWR_LDO_CHAN       4
 
 /* ── Audio (ES8311 + ES7210) ── */
 /* Disabled for bring-up. The codec I2S/PA pins need a trace pass (the LRCK vs
