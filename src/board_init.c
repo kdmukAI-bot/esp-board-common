@@ -1578,7 +1578,8 @@ int board_init(const board_app_config_t *app_cfg,
     touch_handle = board_touch_cst816d_init(i2c_bus, touch_x_max, touch_y_max);
 #elif BOARD_TOUCH_DRIVER == TOUCH_GT911
     touch_handle = board_touch_gt911_init(i2c_bus, touch_x_max, touch_y_max);
-    if (landscape) {
+    /* NULL when no GT911 answered; lvgl_port_setup() then skips touch. */
+    if (landscape && touch_handle) {
         touch_handle->config.flags.swap_xy = 1;
         touch_handle->config.flags.mirror_x = 0;
         touch_handle->config.flags.mirror_y = 1;
