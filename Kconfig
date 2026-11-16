@@ -13,25 +13,4 @@ menu "Board Common"
             The convenience macros BOARD_DISP_H_RES / BOARD_DISP_V_RES
             reflect the logical (post-rotation) dimensions.
 
-    config BOARD_CSI_AE_TARGET
-        int "CSI camera fixed exposure override (0 = sensor/ISP default)"
-        default 0
-        range 0 1200
-        help
-            Fixed exposure applied once at camera start via V4L2_CID_EXPOSURE
-            (csi_set_ae_target in board_pipeline_camera_csi.c). Despite the name,
-            it is written STRAIGHT to the sensor's exposure register — it is not a
-            normalized AE setpoint, and there is no closed AE loop unless an ISP
-            IPA config is wired. So the useful range and "neutral" value are
-            sensor-specific:
-              - OV5647 (Waveshare P4 boards): has on-sensor AGC/AEC, so leave at 0
-                and let the sensor self-adapt.
-              - OV02C10 (Guition): no on-sensor AE, but the board ships an ISP IPA
-                tuning file (BOARD_CAMERA_IPA_CONFIG_NAME), so a closed exposure
-                loop owns this control. Leave at 0 — a fixed value here is
-                overwritten within a few frames, and the driver warns if one is
-                set. Tune exposure in the tuning file instead.
-            Only a sensor with neither on-sensor AE nor an IPA tuning file needs a
-            value here. 0 leaves the sensor/ISP default untouched; higher = brighter.
-
 endmenu

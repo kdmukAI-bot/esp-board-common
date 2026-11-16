@@ -23,10 +23,6 @@
 
 #include "board_i2c.h"
 #include "board_backlight.h"
-#if BOARD_HAS_CAMERA
-#include "board_pipeline.h"
-#include "board_pipeline_display_lvgl.h"
-#endif
 
 #if BOARD_HAS_PMIC
 #include "board_pmic.h"
@@ -1307,150 +1303,6 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     }
 }
 
-/* ── Phase-1 CP1 portrait-scan self-test (throwaway; autonomous device check) ──
- * With no human to drive the UI to a scan, this task toggles portrait mode on the
- * live app screen so a webcam + serial can confirm the display-mode switch works
- * before the camera/reserved-rect/overlay layers (CP2+) are built. Set to 0 to
- * disable. ST7701 only. */
-#define CP1_PORTRAIT_TEST 0
-
-#if CP1_PORTRAIT_TEST && (BOARD_DISPLAY_DRIVER == DISPLAY_ST7701) && BOARD_HAS_CAMERA
-/* Portrait-scan self-test (throwaway; autonomous device validation): LVGL chrome
- * ONLY in the top/bottom letterbox + a real camera preview direct-blitted into
- * the centered 480×480 square through the single-writer gate. Validates the whole
- * portrait composite (reserved-rect + gate + real camera path) WITHOUT the app's
- * scan-navigation or a QR — the webcam sees the live preview. */
-#define CP2_SQ  480                              /* square side           */
-#define CP2_SY  ((BOARD_LCD_V_RES - CP2_SQ) / 2) /* square top row (=160) */
-
-static void cp2_add_letterbox_bg(lv_obj_t *scr, int y, uint32_t color)
-{
-    lv_obj_t *bg = lv_obj_create(scr);
-    lv_obj_remove_style_all(bg);
-    lv_obj_set_size(bg, CP2_SQ, CP2_SY);   /* 480 × 160 letterbox strip */
-    lv_obj_set_pos(bg, 0, y);
-    lv_obj_set_style_bg_color(bg, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
-}
-
-static lv_obj_t *cp2_make_letterbox_screen(void)
-{
-    /* Portrait 480×800 showcase: real LVGL widgets ONLY in the top/bottom
-     * letterbox (never over the camera square 160..639), mimicking the scan
-     * overlay. Each letterbox has its own opaque bg obj that self-invalidates
-     * (so it paints even though the screen-load full invalidation is reserved-
-     * rect-clipped to one side). */
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
-    cp2_add_letterbox_bg(scr, 0, 0x101418);                 /* top    */
-    cp2_add_letterbox_bg(scr, CP2_SY + CP2_SQ, 0x101418);   /* bottom (y=640) */
-
-    /* Top letterbox: title bar + status text. */
-    lv_obj_t *bar = lv_obj_create(scr);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 440, 96);
-    lv_obj_set_pos(bar, 20, 32);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x1E66FF), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(bar, 14, 0);
-    lv_obj_t *title = lv_label_create(bar);
-    lv_label_set_text(title, "SCANNING QR");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_center(title);
-
-    /* Bottom letterbox: progress bar (track + 58% indicator, plain objs so no
-     * LV_USE_BAR dependency) + percent + back chevron. */
-    lv_obj_t *track = lv_obj_create(scr);
-    lv_obj_remove_style_all(track);
-    lv_obj_set_size(track, 380, 36);
-    lv_obj_set_pos(track, 50, 684);
-    lv_obj_set_style_bg_color(track, lv_color_hex(0x303840), 0);
-    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(track, 8, 0);
-    lv_obj_t *ind = lv_obj_create(scr);
-    lv_obj_remove_style_all(ind);
-    lv_obj_set_size(ind, 380 * 58 / 100, 36);
-    lv_obj_set_pos(ind, 50, 684);
-    lv_obj_set_style_bg_color(ind, lv_color_hex(0x00E676), 0);
-    lv_obj_set_style_bg_opa(ind, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(ind, 8, 0);
-
-    lv_obj_t *pct = lv_label_create(scr);
-    lv_label_set_text(pct, "58%");
-    lv_obj_set_style_text_color(pct, lv_color_white(), 0);
-    lv_obj_set_pos(pct, 210, 732);
-
-    lv_obj_t *back = lv_label_create(scr);
-    lv_label_set_text(back, LV_SYMBOL_LEFT "  BACK");
-    lv_obj_set_style_text_color(back, lv_color_hex(0xFFC107), 0);
-    lv_obj_set_pos(back, 30, 730);
-    return scr;
-}
-
-/* CP3: REAL camera preview in portrait — start an actual cam_pipeline whose
- * frames direct-blit into the square (portrait_direct) while LVGL renders the
- * letterbox chrome. Validates the real camera→portrait-square path (orientation,
- * offsets, the gate under real frame rate, DSI underrun with a live PSRAM reader)
- * WITHOUT the app's scan-navigation or a QR — the webcam sees the live preview. */
-static void cp2_camera_portrait_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(12000));  /* let the app settle at Home */
-    ESP_LOGI(TAG, "CP3 real-camera portrait preview: START");
-
-    lvgl_port_lock(0);
-    lv_obj_t *prev = lv_screen_active();
-    lvgl_port_unlock();
-
-    board_display_enter_portrait_scan();
-
-    lvgl_port_lock(0);
-    lv_obj_t *scr = cp2_make_letterbox_screen();
-    lv_screen_load(scr);
-    lvgl_port_unlock();
-
-    /* One-time black-square clear: the FB holds the stale rotated landscape frame
-     * until the first camera frame (~500 ms warmup). */
-    uint16_t *black = heap_caps_aligned_alloc(128, CP2_SQ * CP2_SQ * 2,
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (black) {
-        memset(black, 0, (size_t)CP2_SQ * CP2_SQ * 2);
-        board_display_portrait_scan_blit(0, CP2_SY, CP2_SQ, CP2_SY + CP2_SQ, black);
-        heap_caps_free(black);
-    }
-
-    /* Real camera pipeline: 480×480 square, rotation 0 (native portrait, no
-     * rotate), frames blitted straight into the square through the gate. */
-    cam_pipeline_config_t pcfg =
-        board_pipeline_default_config(scr, board_i2c_get_handle());
-    pcfg.display_width  = CP2_SQ;
-    pcfg.display_height = CP2_SQ;
-    pcfg.rotation       = 0;
-    board_pipeline_lvgl_display_config_t *dc =
-        (board_pipeline_lvgl_display_config_t *)pcfg.display_config;
-    dc->portrait_direct = true;
-    dc->portrait_x = 0;
-    dc->portrait_y = CP2_SY;
-
-    cam_pipeline_handle_t pipe = cam_pipeline_create(&pcfg);
-    if (!pipe) {
-        ESP_LOGE(TAG, "CP3: camera pipeline create FAILED");
-    } else {
-        ESP_LOGI(TAG, "CP3: LIVE camera in portrait square + LVGL letterbox (35s)");
-        vTaskDelay(pdMS_TO_TICKS(35000));
-        cam_pipeline_destroy(pipe);
-    }
-
-    lvgl_port_lock(0);
-    lv_screen_load(prev);
-    lv_obj_delete(scr);
-    lvgl_port_unlock();
-    board_display_exit_portrait_scan();
-    ESP_LOGI(TAG, "CP3: DONE (landscape restored, parking)");
-    vTaskSuspend(NULL);
-}
-#endif
-
 /* ── Board interface implementation ── */
 
 /* Keep the backlight lit continuously from plug-in through the boot logo (no
@@ -1594,10 +1446,6 @@ int board_init(const board_app_config_t *app_cfg,
 
     ESP_LOGI(TAG, "Board initialized (landscape=%d).", landscape);
 
-#if CP1_PORTRAIT_TEST && (BOARD_DISPLAY_DRIVER == DISPLAY_ST7701) && BOARD_HAS_CAMERA
-    xTaskCreatePinnedToCore(cp2_camera_portrait_task, "cp3_cam", 8192, NULL,
-                            2, NULL, tskNO_AFFINITY);
-#endif
     return 0;
 }
 

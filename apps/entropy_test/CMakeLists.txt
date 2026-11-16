@@ -5,7 +5,8 @@ if(NOT DEFINED BOARD)
 endif()
 message(STATUS "Building for board: ${BOARD}")
 
-# esp-board-common component (two levels up)
+# esp-board-common (two levels up) and its components/ (board_camera, ov02c10,
+# board_log_flash)
 # esp-camera-pipeline and its sub-components (cam_pipeline_entropy, ...)
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."

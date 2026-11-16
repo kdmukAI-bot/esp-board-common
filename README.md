@@ -18,7 +18,12 @@ Built as an ESP-IDF component. Apps reference it via `EXTRA_COMPONENT_DIRS` and 
 
 ```
 esp-board-common/
-├── src/                    # Component source (drivers, init, LVGL integration, overlays)
+├── src/                    # Core component source (drivers, init, LVGL integration, overlays)
+├── components/             # Optional components
+│   ├── board_camera/       # Camera drivers, pipeline glue, QR scan coordinator
+│   ├── ov02c10/            # OV02C10 sensor add-on for esp_cam_sensor (P4)
+│   ├── board_log_flash/    # Tee esp_log output to a flash partition
+│   └── esp-camera-pipeline/  # Submodule: frame pipeline, QR and entropy consumers
 ├── boards/                 # Per-board config (board_config.h, sdkconfig.defaults)
 │   ├── waveshare_s3_lcd35b/
 │   ├── waveshare_s3_lcd35/
@@ -58,6 +63,29 @@ Build with a board selection:
 idf.py -DBOARD=waveshare_s3_lcd35b build
 ```
 
+### Camera support
+
+The camera lives in its own component, `board_camera`, so an app without a camera never lists the camera drivers as dependencies, fetches them, or builds them. Such an app needs only the esp-board-common directory on its search path, as above ([apps/touch_test](apps/touch_test/) is an example).
+
+An app that uses the camera adds esp-board-common's `components/` and the camera pipeline's nested `components/` to the search path, and requires `board_camera`:
+
+```cmake
+set(EXTRA_COMPONENT_DIRS
+    "/path/to/esp-board-common"
+    "/path/to/esp-board-common/components"
+    "/path/to/esp-board-common/components/esp-camera-pipeline/components"
+)
+```
+
+```cmake
+idf_component_register(
+    SRCS "main.c"
+    REQUIRES "esp-board-common" "board_camera"
+)
+```
+
+ESP-IDF builds every component it finds on the search path, so an app without a camera that wants another optional component, such as `board_log_flash`, should list that component's directory alone rather than all of `components/`. See [apps/qr_decoder](apps/qr_decoder/) for a complete camera app.
+
 ### Minimal app
 
 ```c
@@ -73,7 +101,7 @@ void app_main(void)
     board_init(&cfg, &disp, &touch);
     board_backlight_set(100);
 
-    // LVGL is ready — create widgets, start tasks, etc.
+    // LVGL is ready: create widgets, start tasks, etc.
 
     board_run();  // never returns
 }
@@ -94,7 +122,7 @@ void app_main(void)
 | DVP | S3 boards | `espressif/esp32-camera` (`esp_camera_fb_get`) |
 | MIPI-CSI | P4 boards | `esp_video` V4L2 layer with ISP pipeline (RAW8 → RGB565) |
 
-Both interfaces use the same unified API (`board_camera_init`, `board_camera_fb_get`, `board_camera_fb_return`). Application code never includes interface-specific headers.
+Both interfaces use the same unified API (`board_camera_init`, `board_camera_fb_get`, `board_camera_fb_return`), provided by the `board_camera` component (see [Camera support](#camera-support)). Application code never includes interface-specific headers.
 
 On ESP32-P4 boards, the PPA (Pixel Processing Accelerator) hardware engine provides zero-CPU-cost downscaling from the sensor resolution (800x1280) to the display (480x800). The camera viewfinder app demonstrates this with fullscreen, hardware-accelerated live video.
 
