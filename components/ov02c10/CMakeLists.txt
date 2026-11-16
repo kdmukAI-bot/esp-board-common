@@ -10,14 +10,23 @@
 # an extra time in script mode (early requirement collection) where CONFIG_* symbols
 # do not exist; gating the whole idf_component_register() on CONFIG_CAMERA_OV02C10
 # would make that pass see no requirements and drop the include paths (driver/gpio.h,
-# esp_cam_sensor.h) from the real compile. Only SRCS/PRIV_INCLUDE_DIRS are gated —
-# the same split esp_cam_sensor's own CMakeLists uses per sensor.
+# esp_cam_sensor.h) from the real compile. Only SRCS/PRIV_INCLUDE_DIRS are gated, the
+# same split esp_cam_sensor's own CMakeLists uses per sensor.
 #
 # esp_cam_sensor's linker fragment gathers the .esp_cam_sensor_detect_fn section
 # from ALL archives (mapping: archive *), so a self-registered detect function in
 # this separate component is picked up by esp_cam_sensor's auto-detect array. The
 # "-u ov02c10_detect" keep prevents the linker from dropping this object (nothing
 # else references it directly).
+
+# ESP32-P4 only. On any other target, register an empty component with no requirements:
+# esp_cam_sensor is fetched only for P4, so the REQUIRES below would fail to resolve
+# wherever a project has this directory on its search path for, say, an S3 build.
+# IDF_TARGET is a build property, so the early requirements pass sees it too.
+if(NOT IDF_TARGET STREQUAL "esp32p4")
+    idf_component_register()
+    return()
+endif()
 
 set(ov02c10_srcs "")
 set(ov02c10_priv_inc "")

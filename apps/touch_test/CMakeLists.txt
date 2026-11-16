@@ -5,12 +5,10 @@ if(NOT DEFINED BOARD)
 endif()
 message(STATUS "Building for board: ${BOARD}")
 
-# esp-board-common component (two levels up)
-# esp-camera-pipeline is a transitive dependency of esp-board-common
+# esp-board-common component (two levels up). The touch test needs no camera, so neither
+# its components/ (board_camera) nor the camera pipeline is on the search path.
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp-camera-pipeline"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp-camera-pipeline/components"
 )
 
 set(BOARD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../boards/${BOARD}")

@@ -1,3 +1,6 @@
+# Core board support: display, touch, PMIC, backlight, SD card, audio, and LVGL setup.
+# Camera support is a separate component, components/board_camera, so a project with
+# no camera never has the camera drivers listed as dependencies (see the README).
 set(SRC_FILES
     "src/board_init.c"
     "src/board_i2c.c"
@@ -11,28 +14,17 @@ set(SRC_FILES
     "src/board_touch_ft6336.c"
     "src/board_touch_cst816d.c"
     "src/board_touch_gt911.c"
-    "src/board_camera.c"
-    "src/board_camera_csi.c"
-    "src/board_pipeline_camera_csi.c"
-    "src/board_pipeline_camera_dvp.c"
-    "src/board_pipeline_display_lvgl.c"
-    "src/board_pipeline.c"
     "src/board_sdcard.c"
     "src/board_audio.c"
     "src/overlay_text.c"
     "src/overlay_rotated.c"
-    "src/scan_coordinator.c"
 )
 
-# All dependencies listed unconditionally where possible. The #if BOARD_HAS_*
-# guards in C source compile out unused peripheral code when the board config
-# doesn't define them. The components just need to be present for include path
-# resolution.
-#
-# Camera components are target-conditional: DVP (esp32-camera) for S3,
-# CSI (esp_driver_cam + esp_cam_sensor) for P4.
+# All dependencies listed unconditionally where possible. The #if BOARD_HAS_* guards in C
+# source compile out unused peripheral code when the board config doesn't define them.
+# The components just need to be present for include path resolution.
 set(REQUIRED_COMPONENTS
-    "esp_lcd" "driver" "esp_adc" "espressif__esp_lvgl_port" "lvgl"
+    "esp_lcd" "driver" "esp_adc" "esp_timer" "espressif__esp_lvgl_port" "lvgl"
     "espressif__esp_lcd_axs15231b"
     "espressif__esp_lcd_st7796"
     "espressif__esp_lcd_touch_ft5x06" "espressif__esp_lcd_touch_cst816s"
@@ -41,23 +33,22 @@ set(REQUIRED_COMPONENTS
     "fatfs" "nvs_flash"
     "espressif__esp_codec_dev"
     "waveshare__pcf85063a" "waveshare__qmi8658"
-    "esp-camera-pipeline" "cam_pipeline_qr"
 )
 
-# I/O expander (TCA9554): required only when the selected board actually has
-# one (BOARD_HAS_IO_EXPANDER 1 in its board_config.h — e.g. the S3 LCD 3.5B,
-# which routes display reset through it). All expander use in the sources is
-# #if BOARD_HAS_IO_EXPANDER-guarded, so a board that defines it 0 can drop
-# the component from the build entirely (a consumer project may additionally
-# EXCLUDE_COMPONENTS it — see seedsigner-micropython-builder). To re-enable
-# for a future board: set BOARD_HAS_IO_EXPANDER 1 (+ BOARD_IO_EXPANDER_ADDR /
-# _RST_PIN) in that board's board_config.h — nothing else.
+# I/O expander (TCA9554): required only when the selected board actually has one
+# (BOARD_HAS_IO_EXPANDER 1 in its board_config.h, e.g. the S3 LCD 3.5B, which routes
+# display reset through it). All expander use in the sources is
+# #if BOARD_HAS_IO_EXPANDER-guarded, so a board that defines it 0 can drop the component
+# from the build entirely (a consumer project may additionally EXCLUDE_COMPONENTS it; see
+# seedsigner-micropython-builder). To re-enable for a future board: set
+# BOARD_HAS_IO_EXPANDER 1 (+ BOARD_IO_EXPANDER_ADDR / _RST_PIN) in that board's
+# board_config.h, nothing else.
 #
-# The env fallback matters: ESP-IDF evaluates this file an extra time in
-# script mode (early REQUIRES collection), where -D cache variables like
-# BOARD_CONFIG_DIR don't exist. The builder exports BOARD_CONFIG_DIR into the
-# environment so both passes agree; if neither is visible we conservatively
-# keep the component (it costs nothing when unused — dead-stripped).
+# The env fallback matters: ESP-IDF evaluates this file an extra time in script mode
+# (early REQUIRES collection), where -D cache variables like BOARD_CONFIG_DIR don't exist.
+# The builder exports BOARD_CONFIG_DIR into the environment so both passes agree; if
+# neither is visible we conservatively keep the component (it costs nothing when unused,
+# since it is dead-stripped).
 set(_bc_cfg_dir "${BOARD_CONFIG_DIR}")
 if(NOT _bc_cfg_dir AND DEFINED ENV{BOARD_CONFIG_DIR})
     set(_bc_cfg_dir "$ENV{BOARD_CONFIG_DIR}")
@@ -82,42 +73,11 @@ if(IDF_TARGET STREQUAL "esp32p4")
     list(APPEND REQUIRED_COMPONENTS "espressif__esp_lcd_st7701")
 endif()
 
-# DVP camera (ESP32-S3 and compatible targets)
-if(NOT IDF_TARGET STREQUAL "esp32p4")
-    list(APPEND REQUIRED_COMPONENTS "espressif__esp32-camera")
-endif()
-
-# CSI camera (ESP32-P4): esp_video V4L2 layer handles CSI + ISP internally.
-# ov02c10 is a standalone esp_cam_sensor add-on (the OV02C10 sensor is not in the
-# public esp_cam_sensor component); it compiles to an empty library unless the
-# board's sdkconfig sets CONFIG_CAMERA_OV02C10, so it is inert on OV5647 boards.
-#
-# esp_ipa is listed explicitly: esp_video takes it as an OPTIONAL PRIVATE
-# requirement, so its headers are not visible transitively, and the CSI driver
-# needs esp_ipa.h to build the runtime-retunable AGC configuration.
-if(IDF_TARGET STREQUAL "esp32p4")
-    list(APPEND REQUIRED_COMPONENTS "esp_driver_cam" "espressif__esp_cam_sensor" "esp_driver_isp" "esp_video" "espressif__esp_ipa" "ov02c10")
-endif()
-
 idf_component_register(
     SRCS ${SRC_FILES}
     INCLUDE_DIRS "src"
     REQUIRES ${REQUIRED_COMPONENTS}
 )
-
-# esp_video's ISP-pipeline entry point (esp_video_isp_pipeline_init) is a linked
-# global, but its declaration lives in the component's PRIV_INCLUDE_DIRS. The CSI
-# driver calls it directly so it can supply its own IPA configuration instead of
-# the flash-resident one esp_video would look up (see board_pipeline_camera_csi.c).
-# Pull that directory in rather than re-declaring the prototype locally, so a
-# component bump that changes the signature fails the build instead of silently
-# mismatching. Harmless on boards that never compile the CSI driver.
-if(IDF_TARGET STREQUAL "esp32p4")
-    idf_component_get_property(esp_video_dir espressif__esp_video COMPONENT_DIR)
-    if(esp_video_dir)
-        target_include_directories(${COMPONENT_LIB} PRIVATE "${esp_video_dir}/private_include")
-    endif()
-endif()
 
 # Board config header: selected at build time via BOARD variable.
 # Consumer project sets BOARD_CONFIG_DIR to the directory containing board_config.h.
